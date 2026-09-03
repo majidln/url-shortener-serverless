@@ -1,0 +1,105 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  url-shortener
+  
+  Sample SAM Template for url-sho
+
+Parameters:
+  StageName:
+    Type: String
+    Default: Dev
+
+Globals:
+  Function:
+    Timeout: 5
+
+Resources:
+  KeyGeneratorFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      CodeUri: cmd/key-generator/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - arm64
+  UrlShortenerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      CodeUri: cmd/url-shortener/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          KEY_GENERATOR_FUNCTION_ARN: !GetAtt  KeyGeneratorFunction.Arn
+          URL_TABLE_NAME: !Ref UrlTable
+      Policies: 
+        - LambdaInvokePolicy:
+            FunctionName: !Ref KeyGeneratorFunction
+        - DynamoDBWritePolicy:
+            TableName: !Ref UrlTable
+      Events:
+        UrlShortener:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: /shorten
+  UrlRedirectFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      CodeUri: cmd/url-redirect/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          URL_TABLE_NAME: !Ref UrlTable
+      Policies: 
+        - DynamoDBReadPolicy:
+            TableName: !Ref UrlTable
+      Events:
+        UrlRedirect:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /{key}
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref StageName
+  UrlTable:
+    Type: AWS::Serverless::SimpleTable
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      PrimaryKey:
+        Name: key
+        Type: String
+
+Outputs:
+  UrlShortenerApi:
+    Description: "API Gateway endpoint URL for Prod stage for Url Shortener function"
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/"
+  KeyGeneratorFunction:
+    Description: "Key Generator Lambda Function ARN"
+    Value: !GetAtt KeyGeneratorFunction.Arn
+  UrlShortenerFunction:
+    Description: "Url Shortener Lambda Function ARN"
+    Value: !GetAtt UrlShortenerFunction.Arn
+  KeyRedirectFunction:
+    Description: "Key Redirect Lambda Function ARN"
+    Value: !GetAtt UrlRedirectFunction.Arn
+  UrlTable:
+    Description: "DynamoDB Table Name"
+    Value: !Ref UrlTable

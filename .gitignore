@@ -1,0 +1,23 @@
+# AWS SAM build output and local invoke artifacts
+.aws-sam/
+
+# Compiled Lambda binary (custom runtime contract name)
+bootstrap
+**/bootstrap
+
+# Local `go build ./...` output — each cmd/<name>/ builds a binary named <name>
+/cmd/key-generator/key-generator
+/cmd/url-redirect/url-redirect
+/cmd/url-shortener/url-shortener
+
+# Go build / test output
+*.exe
+*.test
+*.out
+coverage.txt
+coverage.html
+vendor/
+
+# SAM local / packaging leftovers
+packaged.yaml
+samconfig-*.toml
