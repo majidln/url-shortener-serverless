@@ -89,3 +89,41 @@ transient throttles regardless of the account limit — noted, not done at Step 
 Warm p50 with the conditional write + retry in place (create 149 ms, redirect
 125 ms) is within noise of the earlier plain-`PutItem` run (143 ms / 127 ms).
 The uniqueness guarantee is effectively free on the happy path.
+
+---
+
+## Step 2 — custom domain over HTTPS
+
+`https://link123.cfd/<code>` in front of the `execute-api` URL: ACM certificate
+(DNS-validated via Route 53), HTTP API custom domain, `A`/`AAAA` alias records.
+Same frozen `loadtest.sh`, both endpoints run back to back.
+
+| Path | endpoint | p50 | p95 | p99 | status |
+|---|---|---|---|---|---|
+| `POST /shorten` | `link123.cfd` | 154 ms | 204 ms | 1887 ms | 200× `200` |
+| `POST /shorten` | `execute-api` | 150 ms | 179 ms | 406 ms | 200× `200` |
+| `GET /{code}` | `link123.cfd` | 129 ms | 147 ms | 179 ms | 2000× `302` |
+| `GET /{code}` | `execute-api` | 127 ms | 143 ms | 174 ms | 2000× `302` |
+
+**The custom domain adds no measurable latency.** Redirect p50 differs by 2 ms —
+noise. It's the same regional API Gateway endpoint; the alias record resolves to
+the same IPs and `hey` reuses connections, so the extra DNS lookup is one-time.
+The `POST` p99 gap (1887 vs 406 ms) is which run caught more cold containers, not
+the domain.
+
+### Notes
+
+- **Post-deploy propagation blip.** For a minute or two after `sam deploy`
+  finished, some `GET /{code}` requests returned API Gateway's `{"message":"Not
+  Found"}` (a routing miss, not the redirect Lambda's 404) on both the new domain
+  *and* `execute-api` — the redeployed stage and the new domain mapping settling.
+  Cleared on its own; verify a few minutes after deploy, not immediately.
+- **SAM/ACM friction.** SAM has no shorthand for ACM, so the certificate is a
+  raw `AWS::CertificateManager::Certificate`. Its `DomainValidationOptions`
+  `HostedZoneId` is what lets CloudFormation write the validation `CNAME` itself
+  and block until issued — miss it and the stack hangs waiting on a record that
+  never appears. The `Domain` block also has to be nested under the `HttpApi`
+  `Properties` (not at resource level); put it in the wrong place and the deploy
+  silently no-ops the custom domain.
+- `http://link123.cfd` does not connect — API Gateway custom domains are
+  HTTPS-only. The `http`→`https` redirect is a Step 5 (CloudFront) job.

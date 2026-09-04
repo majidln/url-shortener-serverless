@@ -3,12 +3,18 @@ Transform: AWS::Serverless-2016-10-31
 Description: >
   url-shortener
   
-  Sample SAM Template for url-sho
+  Sample SAM Template for url-shortener
 
 Parameters:
   StageName:
     Type: String
     Default: Dev
+  DomainName:
+    Type: String
+    Description: Hostname the redirect service answers on, e.g. tinyurl.com
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: Route 53 zone that owns DomainName
 
 Globals:
   Function:
@@ -74,10 +80,24 @@ Resources:
             ApiId: !Ref HttpApi
             Method: GET
             Path: /{key}
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
   HttpApi:
     Type: AWS::Serverless::HttpApi
     Properties:
       StageName: !Ref StageName
+      Domain:
+        DomainName: !Ref DomainName
+        CertificateArn: !Ref Certificate
+        SecurityPolicy: TLS_1_2
+        Route53:
+          HostedZoneId: !Ref HostedZoneId
   UrlTable:
     Type: AWS::Serverless::SimpleTable
     DeletionPolicy: Delete
@@ -88,6 +108,9 @@ Resources:
         Type: String
 
 Outputs:
+  CustomDomainUrl:
+    Description: "HTTPS URL for the redirect service on the custom domain"
+    Value: !Sub "https://${DomainName}/"
   UrlShortenerApi:
     Description: "API Gateway endpoint URL for Prod stage for Url Shortener function"
     Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/"

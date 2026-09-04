@@ -18,6 +18,10 @@ region = "us-east-1"
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = true
 resolve_s3 = true
+parameter_overrides = [
+  "DomainName=link123.cfd",
+  "HostedZoneId=Z09272471PEJ61B2BVS5J",
+]
 
 [default.package.parameters]
 region = "us-east-1"
@@ -32,3 +36,4 @@ warm_containers = "EAGER"
 
 [default.local_start_lambda.parameters]
 warm_containers = "EAGER"
+
