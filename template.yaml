@@ -2,19 +2,37 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
   url-shortener
-  
+
   Sample SAM Template for url-shortener
 
 Parameters:
   StageName:
     Type: String
     Default: Dev
+
+  # Everything below resolves from SSM Parameter Store at deploy time. The
+  # values live under /url-shortener/* in the account, not in this repo. Create
+  # them with `aws ssm put-parameter` before deploying.
   DomainName:
-    Type: String
-    Description: Hostname the redirect service answers on, e.g. tinyurl.com
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /url-shortener/domain-name
+    Description: Hostname the redirect service answers on
   HostedZoneId:
-    Type: AWS::Route53::HostedZone::Id
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /url-shortener/hosted-zone-id
     Description: Route 53 zone that owns DomainName
+  NotificationEmail:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /url-shortener/notification-email
+    Description: Backup address for CloudWatch alarm notifications
+  SlackWorkspaceId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /url-shortener/slack-workspace-id
+    Description: AWS Chatbot-authorized Slack workspace id
+  SlackChannelId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /url-shortener/slack-channel-id
+    Description: Slack channel id for alarm notifications
 
 Globals:
   Function:
@@ -31,6 +49,8 @@ Resources:
       Runtime: provided.al2023
       Architectures:
         - arm64
+      LoggingConfig:
+        LogGroup: !Ref KeyGeneratorLogGroup
   UrlShortenerFunction:
     Type: AWS::Serverless::Function
     Metadata:
@@ -41,11 +61,13 @@ Resources:
       Runtime: provided.al2023
       Architectures:
         - arm64
+      LoggingConfig:
+        LogGroup: !Ref ShortenerLogGroup
       Environment:
         Variables:
-          KEY_GENERATOR_FUNCTION_ARN: !GetAtt  KeyGeneratorFunction.Arn
+          KEY_GENERATOR_FUNCTION_ARN: !GetAtt KeyGeneratorFunction.Arn
           URL_TABLE_NAME: !Ref UrlTable
-      Policies: 
+      Policies:
         - LambdaInvokePolicy:
             FunctionName: !Ref KeyGeneratorFunction
         - DynamoDBWritePolicy:
@@ -67,10 +89,12 @@ Resources:
       Runtime: provided.al2023
       Architectures:
         - arm64
+      LoggingConfig:
+        LogGroup: !Ref RedirectLogGroup
       Environment:
         Variables:
           URL_TABLE_NAME: !Ref UrlTable
-      Policies: 
+      Policies:
         - DynamoDBReadPolicy:
             TableName: !Ref UrlTable
       Events:
@@ -80,6 +104,70 @@ Resources:
             ApiId: !Ref HttpApi
             Method: GET
             Path: /{key}
+      AutoPublishAlias: live
+      DeploymentPreference:
+        Type: Canary10Percent5Minutes
+        Alarms:
+          # Http5xxRateAlarm referenced by name, not !Ref: it depends on HttpApi,
+          # HttpApi depends on this function's alias, the alias depends on this
+          # deployment group — !Ref here would close that loop (E3004). CanaryAlarm
+          # has no such dependency, so !Ref is fine and guarantees ordering.
+          - !Sub "${AWS::StackName}-http-5xx-rate"
+          - !Ref CanaryAlarm
+
+  CanaryFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      CodeUri: cmd/canary/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures: [arm64]
+      Timeout: 15
+      LoggingConfig:
+        LogGroup: !Ref CanaryLogGroup
+      Environment:
+        Variables:
+          PROBE_BASE_URL: !Sub "https://${DomainName}"
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: cloudwatch:PutMetricData
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  cloudwatch:namespace: UrlShortener/Canary
+      Events:
+        Tick:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+
+
+  # Declared so retention is bounded and the groups die with the stack, instead
+  # of Lambda auto-creating them as never-expire and orphaning them on delete.
+  KeyGeneratorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-key-generator"
+      RetentionInDays: 14
+  ShortenerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-url-shortener"
+      RetentionInDays: 14
+  RedirectLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-url-redirect"
+      RetentionInDays: 14
+  CanaryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-canary"
+      RetentionInDays: 14
+
   Certificate:
     Type: AWS::CertificateManager::Certificate
     Properties:
@@ -106,6 +194,218 @@ Resources:
       PrimaryKey:
         Name: key
         Type: String
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alarms"
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  ChatbotRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: chatbot.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess
+
+  SlackAlarmChannel:
+    Type: AWS::Chatbot::SlackChannelConfiguration
+    Properties:
+      ConfigurationName: !Sub "${AWS::StackName}-alarms"
+      IamRoleArn: !GetAtt ChatbotRole.Arn
+      SlackWorkspaceId: !Ref SlackWorkspaceId
+      SlackChannelId: !Ref SlackChannelId
+      SnsTopicArns:
+        - !Ref AlarmTopic
+
+  Http5xxRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-http-5xx-rate"
+      AlarmDescription: >-
+        HTTP API 5xx rate over 5% for 3 of 5 minutes. Pages on the front door,
+        not on Lambda Errors (a 500 the handler returns cleanly is a successful
+        invocation). Floored: ignored below 10 req/min — the canary covers the
+        zero-traffic case.
+      Metrics:
+        - Id: err
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApiGateway
+              MetricName: 5xx
+              Dimensions:
+                - Name: ApiId
+                  Value: !Ref HttpApi
+            Period: 60
+            Stat: Sum
+        - Id: total
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApiGateway
+              MetricName: Count
+              Dimensions:
+                - Name: ApiId
+                  Value: !Ref HttpApi
+            Period: 60
+            Stat: Sum
+        - Id: rate
+          Expression: "IF(total >= 10, 100 * err / total, 0)"
+          Label: 5xx % of requests
+          ReturnData: true
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  # Zero-traffic watchdog and the deploy gate. Missing data = breaching: a
+  # canary that goes silent is itself a failure.
+  CanaryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-canary-redirect"
+      AlarmDescription: >-
+        Synthetic create+redirect probe failed 3 of the last 5 minutes. Works
+        with zero organic traffic.
+      Namespace: UrlShortener/Canary
+      MetricName: Success
+      Dimensions:
+        - Name: Probe
+          Value: redirect
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Ref AWS::StackName
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "HTTP API - traffic & errors",
+                "region": "${AWS::Region}", "period": 60, "stat": "Sum",
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiId", "${HttpApi}" ],
+                  [ "AWS/ApiGateway", "4xx", "ApiId", "${HttpApi}" ],
+                  [ "AWS/ApiGateway", "5xx", "ApiId", "${HttpApi}" ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "HTTP API - 5xx rate %",
+                "region": "${AWS::Region}", "period": 60,
+                "metrics": [
+                  [ "AWS/ApiGateway", "5xx", "ApiId", "${HttpApi}", { "id": "m5xx", "stat": "Sum", "visible": false } ],
+                  [ "AWS/ApiGateway", "Count", "ApiId", "${HttpApi}", { "id": "mc", "stat": "Sum", "visible": false } ],
+                  [ { "expression": "IF(mc >= 10, 100*m5xx/mc, 0)", "label": "5xx %", "id": "e1" } ]
+                ],
+                "yAxis": { "left": { "min": 0 } },
+                "annotations": { "horizontal": [ { "label": "alarm at 5%", "value": 5 } ] }
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "HTTP API - latency (ms)",
+                "region": "${AWS::Region}", "period": 60,
+                "metrics": [
+                  [ "AWS/ApiGateway", "Latency", "ApiId", "${HttpApi}", { "stat": "p50", "label": "Latency p50" } ],
+                  [ "AWS/ApiGateway", "Latency", "ApiId", "${HttpApi}", { "stat": "p99", "label": "Latency p99" } ],
+                  [ "AWS/ApiGateway", "IntegrationLatency", "ApiId", "${HttpApi}", { "stat": "p99", "label": "Integration p99" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda - errors & throttles",
+                "region": "${AWS::Region}", "period": 60, "stat": "Sum",
+                "metrics": [
+                  [ "AWS/Lambda", "Errors", "FunctionName", "${UrlRedirectFunction}", { "label": "redirect errors" } ],
+                  [ "AWS/Lambda", "Errors", "FunctionName", "${UrlShortenerFunction}", { "label": "shortener errors" } ],
+                  [ "AWS/Lambda", "Errors", "FunctionName", "${KeyGeneratorFunction}", { "label": "key-generator errors" } ],
+                  [ "AWS/Lambda", "Errors", "FunctionName", "${CanaryFunction}", { "label": "canary errors" } ],
+                  [ "AWS/Lambda", "Throttles", "FunctionName", "${UrlRedirectFunction}", { "label": "redirect throttles" } ],
+                  [ "AWS/Lambda", "Throttles", "FunctionName", "${UrlShortenerFunction}", { "label": "shortener throttles" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda - duration p99 (ms)",
+                "region": "${AWS::Region}", "period": 60, "stat": "p99",
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${UrlRedirectFunction}", { "label": "redirect" } ],
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${UrlShortenerFunction}", { "label": "shortener" } ],
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${KeyGeneratorFunction}", { "label": "key-generator" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "DynamoDB - capacity & throttles",
+                "region": "${AWS::Region}", "period": 60, "stat": "Sum",
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${UrlTable}" ],
+                  [ "AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${UrlTable}" ],
+                  [ "AWS/DynamoDB", "ThrottledRequests", "TableName", "${UrlTable}" ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 18, "width": 8, "height": 6,
+              "properties": {
+                "title": "Canary - redirect probe (1 = pass)",
+                "region": "${AWS::Region}", "period": 60, "stat": "Minimum",
+                "metrics": [
+                  [ "UrlShortener/Canary", "Success", "Probe", "redirect" ]
+                ],
+                "yAxis": { "left": { "min": 0, "max": 1 } }
+              }
+            },
+            {
+              "type": "alarm", "x": 8, "y": 18, "width": 16, "height": 6,
+              "properties": {
+                "title": "Alarms",
+                "alarms": [ "${Http5xxRateAlarm.Arn}", "${CanaryAlarm.Arn}" ]
+              }
+            }
+          ]
+        }
+
+
 
 Outputs:
   CustomDomainUrl:
@@ -126,3 +426,18 @@ Outputs:
   UrlTable:
     Description: "DynamoDB Table Name"
     Value: !Ref UrlTable
+  AlarmTopicArn:
+    Description: "SNS topic every alarm publishes to (fans out to Slack + backup email)"
+    Value: !Ref AlarmTopic
+  DashboardUrl:
+    Description: "CloudWatch dashboard — the diagnosis surface"
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/${AWS::StackName}"
+  Http5xxAlarmName:
+    Description: "Front-door paging alarm (HTTP API 5xx rate); also gates redirect deploys"
+    Value: !Ref Http5xxRateAlarm
+  CanaryAlarmName:
+    Description: "Synthetic canary watchdog; also gates redirect deploys"
+    Value: !Ref CanaryAlarm
+  CanaryFunctionName:
+    Description: "Scheduled canary function (probes the public URL every minute)"
+    Value: !Ref CanaryFunction
