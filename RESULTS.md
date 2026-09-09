@@ -127,3 +127,77 @@ the domain.
   silently no-ops the custom domain.
 - `http://link123.cfd` does not connect — API Gateway custom domains are
   HTTPS-only. The `http`→`https` redirect is a Step 5 (CloudFront) job.
+
+---
+
+## Step 3 — observability & safe deploys
+
+What this step added:
+
+- **Alarms** on the HTTP API `5xx` **rate** (`5xx ÷ Count`, floored below
+  10 req/min) and on a **1/minute synthetic canary** that runs the real user
+  path (`POST /shorten` → `GET /{key}`) against `https://link123.cfd` and emits
+  a custom metric `UrlShortener/Canary/Success` (1/0).
+- Both alarms → one **SNS topic** → Slack (AWS Chatbot) + a backup email.
+- Redirect function on `AutoPublishAlias: live` +
+  `DeploymentPreference: Canary10Percent5Minutes`, both alarms as the
+  auto-rollback gate.
+- Config (domain, hosted zone id, email, Slack ids) moved out of the repo into
+  **SSM Parameter Store**; four **log groups** declared with 14-day retention.
+- A CloudWatch **dashboard** (API / Lambda / DynamoDB / canary panels + alarm
+  tiles) as the diagnosis surface.
+
+### Warm baseline — frozen `loadtest.sh` via `link123.cfd`
+
+| Path | n / conc | p50 | p95 | p99 | status |
+|---|---|---|---|---|---|
+| `POST /shorten` | 200 / 5 | 144 ms | 168 ms | 1957 ms | 200× `200` |
+| `GET /{code}` | 2000 / 10 | 132 ms | 149 ms | 171 ms | 2000× `302` |
+
+Redirect p50 across the three steps: **125 → 129 → 132 ms** — all noise. The
+`AutoPublishAlias` alias indirection and the once-a-minute canary traffic add
+**no measurable latency**; alias routing is resolved in the API Gateway
+integration config, not per request. `POST` p99 (1957 ms) is the usual handful
+of cold containers in the opening requests.
+
+### Proof 2 — real outage, detected and recovered
+
+Redirect broken by `aws lambda put-function-concurrency
+--reserved-concurrent-executions 0` (every redirect throttles → API Gateway
+`503`), ~1 req/s of synthetic traffic during the window, then
+`delete-function-concurrency` to restore. Timings from CloudWatch alarm history.
+
+| Transition | `canary-redirect` | `http-5xx-rate` |
+|---|---|---|
+| break → `ALARM` | **3m02s** | **3m18s** |
+| restore → `OK` | **3m26s** | **4m42s** |
+
+- Both alarms use `DatapointsToAlarm: 3` over 1-minute periods, so ~3 min to
+  fire is the design floor — matched exactly. The `5xx` alarm reason recorded
+  `[97.1%, 97.7%, 92.6%] > 5.0` — the `5xx ÷ Count` metric-math and the
+  10-req/min floor both behaved as intended.
+- `5xx` recovers slower than it fires (4m42s) because after the fix API Gateway
+  needs a fresh clean minute published before non-breaching datapoints
+  accumulate; the canary clears faster (fewer datapoints, one per minute).
+- Each transition fired `AlarmActions` / `OKActions` → SNS → Slack + email
+  (2 alert + 2 recovery messages per run).
+
+### Finding: leftover manual test levers persist silently
+
+The first proof attempt found `ReservedConcurrentExecutions: 0` **already set**
+on the redirect function from an earlier manual test that was never cleaned up —
+redirects had been fully down (225 throttles / 5 min, every request `503`) for
+an unknown period. The `canary-redirect` alarm was correctly in `ALARM` the
+whole time; the observability added in this step is exactly what surfaced it.
+Lesson: CLI test levers (`put-function-concurrency`, env-var overrides on
+`$LATEST`) don't show up in `sam deploy` diffs and must be reverted explicitly —
+`update-function-configuration` on `$LATEST` also can't be used to break the
+deployed service now that `AutoPublishAlias` pins traffic to a published
+version.
+
+### Not yet run
+
+Proof 1 (force alarm state) is trivial and effectively covered by the transitions
+above. Proof 3 (ship a deliberately broken redirect, watch CodeDeploy roll it
+back inside the 5-minute bake) still pending — needs a redirect code change plus
+load during the bake.

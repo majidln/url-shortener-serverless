@@ -1,12 +1,9 @@
-# More information about the configuration file can be found here:
-# https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-config.html
 version = 0.1
 
 [default.global.parameters]
 stack_name = "url-shortener"
 
 [default.build.parameters]
-region = "us-east-1"
 cached = true
 parallel = true
 
@@ -18,22 +15,5 @@ region = "us-east-1"
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = true
 resolve_s3 = true
-parameter_overrides = [
-  "DomainName=link123.cfd",
-  "HostedZoneId=Z09272471PEJ61B2BVS5J",
-]
-
-[default.package.parameters]
-region = "us-east-1"
-resolve_s3 = true
-
-[default.sync.parameters]
-region = "us-east-1"
-watch = true
-
-[default.local_start_api.parameters]
-warm_containers = "EAGER"
-
-[default.local_start_lambda.parameters]
-warm_containers = "EAGER"
-
+# Stack parameters resolve from SSM (/url-shortener/*) via their Default in
+# template.yaml — no parameter_overrides needed.

@@ -9,6 +9,7 @@ bootstrap
 /cmd/key-generator/key-generator
 /cmd/url-redirect/url-redirect
 /cmd/url-shortener/url-shortener
+/cmd/canary/canary
 
 # Go build / test output
 *.exe
