@@ -1,0 +1,76 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  url-shortener cache — ElastiCache (Valkey), single node, in the private
+  subnets exported by the main stack. Created and destroyed per session. The
+  main stack has NO CloudFormation dependency on this stack: the endpoint is
+  handed off through SSM, which the redirect handler reads at cold start and
+  treats as optional.
+
+Parameters:
+  NetworkStackName:
+    Type: String
+    Default: url-shortener
+    Description: Main stack that exports the private subnets and the cache security group.
+
+  NodeType:
+    Type: String
+    Default: cache.t4g.micro
+    Description: Smallest current gen. Priced hourly because this is destroyed nightly.
+
+  EngineVersion:
+    Type: String
+    Default: "7.2"
+    Description: Valkey engine version.
+
+  EndpointParamName:
+    Type: String
+    Default: /url-shortener/cache/endpoint
+    Description: SSM parameter (host:port) the redirect handler reads at cold start.
+
+Resources:
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: !Sub "${AWS::StackName} private subnets"
+      SubnetIds:
+        Fn::Split:
+          - ","
+          - Fn::ImportValue: !Sub "${NetworkStackName}-private-subnet-ids"
+
+  CacheReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Ref AWS::StackName
+      ReplicationGroupDescription: url-shortener redirect cache
+      Engine: valkey
+      EngineVersion: !Ref EngineVersion
+      CacheNodeType: !Ref NodeType
+      NumCacheClusters: 1              # one node, no replica
+      AutomaticFailoverEnabled: false # requires >= 2 nodes
+      MultiAZEnabled: false
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds:
+        - Fn::ImportValue: !Sub "${NetworkStackName}-cache-sg-id"
+      # SG isolation only. Production would set TransitEncryptionEnabled: true
+      # plus an AuthToken or Valkey RBAC users.
+      TransitEncryptionEnabled: false
+      AtRestEncryptionEnabled: true
+      AutoMinorVersionUpgrade: true
+
+  # The hand-off. The redirect Lambda reads this at init; if it is missing or
+  # the address is unreachable, L2 is simply skipped.
+  CacheEndpointParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Ref EndpointParamName
+      Type: String
+      Value: !Sub "${CacheReplicationGroup.PrimaryEndPoint.Address}:${CacheReplicationGroup.PrimaryEndPoint.Port}"
+      Description: host:port of the Valkey primary — written by the cache stack, read by url-redirect
+
+Outputs:
+  CacheEndpoint:
+    Description: host:port of the Valkey primary
+    Value: !Sub "${CacheReplicationGroup.PrimaryEndPoint.Address}:${CacheReplicationGroup.PrimaryEndPoint.Port}"
+  EndpointParamName:
+    Description: SSM parameter carrying the endpoint
+    Value: !Ref EndpointParamName

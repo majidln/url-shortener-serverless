@@ -201,3 +201,89 @@ Proof 1 (force alarm state) is trivial and effectively covered by the transition
 above. Proof 3 (ship a deliberately broken redirect, watch CodeDeploy roll it
 back inside the 5-minute bake) still pending — needs a redirect code change plus
 load during the bake.
+
+---
+
+## Step 4 — caching the redirect lookup
+
+Two tiers in front of DynamoDB, in `cmd/url-redirect`:
+
+- **L1** — in-process TTL map, 60 s TTL, 5000 entries, one per execution
+  environment.
+- **L2** — shared ElastiCache **Valkey** (`cache.t4g.micro`, 1 node) in a
+  private VPC subnet. Endpoint read from SSM at cold start; a missing/unreachable
+  endpoint disables L2 silently.
+
+Flow: `L1 → L2 → DynamoDB`, populating both tiers on the way out; any L2 error
+falls straight through.
+
+### Latency — frozen `loadtest.sh` (single hot key)
+
+| Path | p50 | p95 | p99 |
+|---|---|---|---|
+| `POST /shorten` | 142 ms | 172 ms | 1828 ms |
+| `GET /{code}` | 124 ms | 140 ms | 158 ms |
+
+Redirect p50 across the four steps: **125 → 129 → 132 → 124 ms** — flat. The
+cache buys **no latency**; the path is API Gateway + TLS + network bound and the
+`GetItem` it removes is ~5 ms of that. Exactly what the guide predicted.
+
+### Tier mix — needs a many-key workload
+
+The frozen script hammers **one** key, so each container misses once (fills its
+own L1) then serves `l1` forever; L2 is never consulted. A **many-key burst**
+(3000 requests spread over 100 codes, `-P 8`):
+
+| tier | count | share |
+|---|---|---|
+| `l1` (in-process) | 1995 | 66% |
+| `l2` (Valkey) | 767 | 26% |
+| `miss` (DynamoDB) | 241 | 8% |
+
+Overall hit rate **92%**; only **8% of redirects reached DynamoDB**. Without L2,
+those 767 `l2` hits would have been origin reads — **L2 cut DynamoDB reads
+~76%** for this workload (~1008 → 241). Confirmed table-side:
+`ConsumedReadCapacityUnits` over the burst ≈ 117 RCU ≈ 234 eventually-consistent
+`GetItem`s, matching the `miss` count. Redirect Lambda `Duration` averaged
+**~2.5 ms** during the burst (Step 3 was ~15 ms) — most requests skip the
+DynamoDB SDK call entirely.
+
+### The VPC — what it actually cost
+
+1. `VpcConfig` on the redirect function → no route to the internet or AWS public
+   endpoints.
+2. **DynamoDB** — free **Gateway** endpoint, a route-table entry. Worked first
+   try. Zero NAT.
+3. **SSM** (handler reads the cache endpoint from Parameter Store at cold start)
+   — needs an **Interface** endpoint, ~$7/mo per ENI. Gateway endpoints exist
+   only for S3 and DynamoDB.
+4. **An interface endpoint must be in every subnet the Lambda runs in.** First
+   attempt put it in one of the two private subnets → ~1/3 of cold starts (ENI
+   in the other subnet) still timed out on SSM and fell back to L1 + DynamoDB,
+   silently. Fixed by placing it in both subnets (~$14/mo for the pair). The
+   2 s SSM timeout was bumped to 3 s — the first call through a fresh endpoint
+   occasionally runs long.
+5. `aws ec2 describe-nat-gateways` → empty.
+
+Reachability rule, recorded for later:
+
+| From a VPC Lambda | via | cost |
+|---|---|---|
+| S3, DynamoDB | Gateway endpoint | free |
+| SSM, Secrets Manager, STS, SNS… | Interface endpoint | ~$7/mo per ENI |
+| public internet | NAT Gateway | ~$32/mo |
+
+### Graceful degradation — verified
+
+`make cache-down` (cache stack deleted, SSM parameter gone), then redirects:
+still `302`, no `5xx`, no per-request latency bump — L2 is disabled once at cold
+start (`h.l2 == nil`), not failing per request, so there's no 75 ms timeout to
+pay. Tier field is only `l1` / `miss`. `make cache-up` again and `l2` reappears
+in the mix. Also covered by unit tests and, earlier, by the single-subnet
+misconfiguration (SSM unreachable → same clean fallback).
+
+### Cost at rest
+
+Cache stack (`cache.t4g.micro`, ~$0.016/hr) — `make cache-down` before ending a
+session. SSM interface endpoint (~$14/mo, two ENIs) lives in the permanent
+network resources.
