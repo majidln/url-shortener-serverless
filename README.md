@@ -1,19 +1,24 @@
 # URL Shortener
 
-A serverless URL shortener on AWS, built with SAM. Three Go Lambdas behind an
-HTTP API with a custom domain over HTTPS, backed by a single on-demand DynamoDB
-table. See [PLANNING.md](PLANNING.md) for the step-by-step roadmap; the current
-step guide is [STEP-2-GUIDE.md](STEP-2-GUIDE.md).
+A serverless URL shortener on AWS, built with SAM. Go Lambdas behind an HTTP API
+with a custom domain over HTTPS, a DynamoDB table, CloudWatch alarms + a
+synthetic canary, and a two-tier read cache. See [PLANNING.md](PLANNING.md) for
+the step-by-step roadmap; the current step guide is
+[STEP-4-GUIDE.md](STEP-4-GUIDE.md).
 
 ## Architecture
 
 | Component | Role |
 |---|---|
 | `cmd/url-shortener` | `POST /shorten` — takes a URL, calls `key-generator`, writes `{key, url, created_at}` to DynamoDB with a conditional put + bounded retry so a collision never overwrites, returns the key |
-| `cmd/url-redirect` | `GET /{key}` — looks the key up, returns `302` to the stored URL (`404` on miss) |
+| `cmd/url-redirect` | `GET /{key}` — `L1 (in-process) → L2 (Valkey) → DynamoDB`, filling both caches on the way out; `302` to the stored URL, `404` on miss. Runs in a private VPC subnet. |
 | `cmd/key-generator` | Pure function: random 7-char base62 key from `crypto/rand`. No storage access, invoked directly (no API Gateway), IAM role has zero DynamoDB permissions |
+| `cmd/canary` | Scheduled every minute; runs `POST /shorten` → `GET /{key}` against the public URL and emits a `UrlShortener/Canary/Success` metric |
 | `UrlTable` | DynamoDB `SimpleTable`, partition key `key`, on-demand billing |
 | `HttpApi` + `Certificate` | HTTP API with a custom domain; ACM cert, DNS-validated via Route 53, wired through SAM's `Domain` block |
+| Alarms + SNS + Chatbot | HTTP API `5xx`-rate and canary alarms → SNS → Slack + backup email; the redirect function deploys via `Canary10Percent5Minutes` with these as the rollback gate |
+| VPC + `DynamoDBEndpoint` | Private subnets, **no NAT** — the redirect Lambda reaches DynamoDB through a free gateway endpoint |
+| **cache stack** (`cache/`) | ElastiCache Valkey — a **separate** CloudFormation stack, created and destroyed per session (see below) |
 
 Each function under `cmd/` is its own Go module with its own `go.mod`.
 
@@ -58,6 +63,33 @@ missing.
 Outputs: `CustomDomainUrl` (the HTTPS URL to use) and `UrlShortenerApi` (the raw
 `execute-api` URL, still live).
 
+## Cache stack (Step 4)
+
+The shared Valkey cache (L2) lives in **its own CloudFormation stack** under
+`cache/`, driven by `make` targets. It is the first thing that bills at rest, so
+it is created at the start of a work session and destroyed at the end.
+
+```bash
+make cache-up      # deploy the ElastiCache stack, print the endpoint  (~5–10 min)
+make cache-status  # StackStatus, or "not deployed"
+make cache-down    # delete it — run before ending the session
+```
+
+**Order:**
+
+1. `sam deploy` — the main stack first. It creates the VPC and exports the
+   subnet / security-group ids that the cache stack imports. The redirect
+   function works immediately, running on **L1 + DynamoDB only** (no L2 yet).
+2. `make cache-up` — deploys ElastiCache into those subnets and writes its
+   endpoint to SSM at `/url-shortener/cache/endpoint`.
+3. The redirect Lambda reads that SSM parameter at **cold start**, so L2 engages
+   for containers that start after step 2 — a few minutes, or force it with
+   `sam deploy` / a new function version.
+
+If the cache stack is absent (never deployed, or `make cache-down`), the SSM
+parameter doesn't exist, `l2` is disabled, and the service runs on L1 +
+DynamoDB. Deleting it never breaks redirects.
+
 ## Endpoints
 
 Base URL: `https://<your-domain>` (the `CustomDomainUrl` output). The
@@ -93,14 +125,15 @@ Each module is tested on its own:
 
 ```bash
 cd cmd/key-generator && go test ./...
-cd cmd/url-redirect  && go test ./...
+cd cmd/url-redirect  && go test ./...   # in-process + Valkey cache, via fakes and miniredis
 cd cmd/url-shortener && go test ./...
+cd cmd/canary        && go test ./...
 ```
 
-All three at once, from this directory:
+All four at once, from this directory:
 
 ```bash
-for d in cmd/key-generator cmd/url-redirect cmd/url-shortener; do
+for d in cmd/key-generator cmd/url-redirect cmd/url-shortener cmd/canary; do
   echo "=== $d ==="; (cd "$d" && go test ./...)
 done
 ```

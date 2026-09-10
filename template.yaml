@@ -91,12 +91,27 @@ Resources:
         - arm64
       LoggingConfig:
         LogGroup: !Ref RedirectLogGroup
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
       Environment:
         Variables:
           URL_TABLE_NAME: !Ref UrlTable
+          CACHE_TTL_SECONDS: "60"
+          CACHE_MAX_ENTRIES: "5000"
+          # L2: read at cold start. If the cache stack isn't deployed this
+          # parameter won't exist and the handler runs on L1 + DynamoDB.
+          CACHE_ENDPOINT_PARAM: /url-shortener/cache/endpoint
       Policies:
         - DynamoDBReadPolicy:
             TableName: !Ref UrlTable
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/url-shortener/cache/*"
       Events:
         UrlRedirect:
           Type: HttpApi
@@ -168,6 +183,40 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-canary"
       RetentionInDays: 14
 
+  # Step 4: turn the redirect handler's `cache` log field (l1 | l2 | miss) into
+  # metrics, no API call on the hot path.
+  #   overall hit rate = (CacheL1 + CacheL2) / (CacheL1 + CacheL2 + CacheOrigin)
+  RedirectCacheL1Filter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref RedirectLogGroup
+      FilterPattern: '{ $.cache = "l1" }'
+      MetricTransformations:
+        - MetricNamespace: UrlShortener/Redirect
+          MetricName: CacheL1
+          MetricValue: "1"
+          DefaultValue: 0
+  RedirectCacheL2Filter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref RedirectLogGroup
+      FilterPattern: '{ $.cache = "l2" }'
+      MetricTransformations:
+        - MetricNamespace: UrlShortener/Redirect
+          MetricName: CacheL2
+          MetricValue: "1"
+          DefaultValue: 0
+  RedirectCacheOriginFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref RedirectLogGroup
+      FilterPattern: '{ $.cache = "miss" }'
+      MetricTransformations:
+        - MetricNamespace: UrlShortener/Redirect
+          MetricName: CacheOrigin
+          MetricValue: "1"
+          DefaultValue: 0
+
   Certificate:
     Type: AWS::CertificateManager::Certificate
     Properties:
@@ -194,6 +243,122 @@ Resources:
       PrimaryKey:
         Name: key
         Type: String
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-vpc" }
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.0.0/20
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-private-a" }
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.16.0/20
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-private-b" }
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-private-rt" }
+
+  PrivateSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  DynamoDBEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: url-redirect Lambda ENIs
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-lambda-sg" }
+
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ElastiCache Valkey
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-cache-sg" }
+
+  # DynamoDB gets a free Gateway endpoint (above). Every other AWS service the
+  # VPC'd redirect Lambda calls needs a paid Interface endpoint (PrivateLink):
+  # an ENI with a private IP, reached over HTTPS. Right now that's just SSM,
+  # which the handler reads at cold start for the cache endpoint.
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: VPC interface endpoints - HTTPS from the Lambda SG only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-endpoints-sg" }
+
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssm"
+      VpcEndpointType: Interface
+      SubnetIds:
+        # One ENI per AZ the Lambda runs in. With only subnet A, ~1/3 of cold
+        # starts (the ones whose ENI landed in subnet B) still couldn't reach
+        # SSM and fell back to L1 + DynamoDB. ~$14/mo for the pair.
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+      # Makes ssm.<region>.amazonaws.com resolve to this endpoint's private IP
+      # inside the VPC, so the AWS SDK needs no change.
+      PrivateDnsEnabled: true
+
   AlarmTopic:
     Type: AWS::SNS::Topic
     Properties:
@@ -401,6 +566,22 @@ Resources:
                 "title": "Alarms",
                 "alarms": [ "${Http5xxRateAlarm.Arn}", "${CanaryAlarm.Arn}" ]
               }
+            },
+            {
+              "type": "metric", "x": 0, "y": 24, "width": 12, "height": 6,
+              "properties": {
+                "title": "Redirect - cache tier mix %",
+                "region": "${AWS::Region}", "period": 300, "stat": "Sum",
+                "metrics": [
+                  [ "UrlShortener/Redirect", "CacheL1", { "id": "l1", "visible": false } ],
+                  [ "UrlShortener/Redirect", "CacheL2", { "id": "l2", "visible": false } ],
+                  [ "UrlShortener/Redirect", "CacheOrigin", { "id": "o", "visible": false } ],
+                  [ { "expression": "100*l1/(l1+l2+o)", "label": "L1 %", "id": "e1" } ],
+                  [ { "expression": "100*l2/(l1+l2+o)", "label": "L2 %", "id": "e2" } ],
+                  [ { "expression": "100*o/(l1+l2+o)", "label": "origin %", "id": "e3" } ]
+                ],
+                "yAxis": { "left": { "min": 0, "max": 100 } }
+              }
             }
           ]
         }
@@ -441,3 +622,16 @@ Outputs:
   CanaryFunctionName:
     Description: "Scheduled canary function (probes the public URL every minute)"
     Value: !Ref CanaryFunction
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub "${AWS::StackName}-vpc-id" }
+  PrivateSubnetIds:
+    Description: "Comma-separated, for VpcConfig and the ElastiCache subnet group"
+    Value: !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+    Export: { Name: !Sub "${AWS::StackName}-private-subnet-ids" }
+  LambdaSecurityGroupId:
+    Value: !Ref LambdaSecurityGroup
+    Export: { Name: !Sub "${AWS::StackName}-lambda-sg-id" }
+  CacheSecurityGroupId:
+    Value: !Ref CacheSecurityGroup
+    Export: { Name: !Sub "${AWS::StackName}-cache-sg-id" }

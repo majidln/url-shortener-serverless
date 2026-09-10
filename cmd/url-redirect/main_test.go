@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -190,5 +191,64 @@ func TestRedirectSkipsLookupWithoutKey(t *testing.T) {
 	}
 	if f.calls != 0 {
 		t.Errorf("GetItem called %d times, want 0", f.calls)
+	}
+}
+
+// Layer 1: a second request for the same key is served from memory, no GetItem.
+func TestRedirectServesSecondCallFromCache(t *testing.T) {
+	f := &fakeGetter{out: &dynamodb.GetItemOutput{Item: item("abc1234", "https://example.com/x")}}
+	h := &handler{ddb: f, table: "test-table", l1: newL1Cache(time.Minute, 10)}
+
+	for i := 1; i <= 3; i++ {
+		resp, err := h.Redirect(context.Background(), requestFor("abc1234"))
+		if err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+		if resp.StatusCode != 302 || resp.Headers["Location"] != "https://example.com/x" {
+			t.Fatalf("call %d: status %d, Location %q", i, resp.StatusCode, resp.Headers["Location"])
+		}
+	}
+	if f.calls != 1 {
+		t.Errorf("GetItem called %d times, want 1 (calls 2 and 3 served from cache)", f.calls)
+	}
+}
+
+// Once the TTL passes, the next request goes back to DynamoDB.
+func TestRedirectCacheExpiresBackToDynamo(t *testing.T) {
+	f := &fakeGetter{out: &dynamodb.GetItemOutput{Item: item("abc1234", "https://example.com/x")}}
+	c := newL1Cache(time.Minute, 10)
+	now, advance := fixedClock(time.Unix(0, 0))
+	c.now = now
+	h := &handler{ddb: f, table: "test-table", l1: c}
+
+	h.Redirect(context.Background(), requestFor("abc1234")) // miss -> GetItem, cached
+	h.Redirect(context.Background(), requestFor("abc1234")) // hit
+	if f.calls != 1 {
+		t.Fatalf("before expiry: GetItem calls = %d, want 1", f.calls)
+	}
+
+	advance(61 * time.Second)
+	h.Redirect(context.Background(), requestFor("abc1234")) // expired -> GetItem again
+	if f.calls != 2 {
+		t.Errorf("after expiry: GetItem calls = %d, want 2", f.calls)
+	}
+}
+
+// A 404 must not be cached: if the row later appears, the next request finds it.
+func TestRedirectDoesNotCacheMisses(t *testing.T) {
+	f := &fakeGetter{out: &dynamodb.GetItemOutput{}} // no item -> 404
+	h := &handler{ddb: f, table: "test-table", l1: newL1Cache(time.Minute, 10)}
+
+	if resp, _ := h.Redirect(context.Background(), requestFor("abc1234")); resp.StatusCode != 404 {
+		t.Fatalf("first call status = %d, want 404", resp.StatusCode)
+	}
+
+	f.out = &dynamodb.GetItemOutput{Item: item("abc1234", "https://example.com/late")}
+	resp, _ := h.Redirect(context.Background(), requestFor("abc1234"))
+	if resp.StatusCode != 302 || resp.Headers["Location"] != "https://example.com/late" {
+		t.Errorf("second call = %d %q, want 302 https://example.com/late", resp.StatusCode, resp.Headers["Location"])
+	}
+	if f.calls != 2 {
+		t.Errorf("GetItem calls = %d, want 2 (the 404 was not cached)", f.calls)
 	}
 }
