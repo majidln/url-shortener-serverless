@@ -287,3 +287,168 @@ misconfiguration (SSM unreachable → same clean fallback).
 Cache stack (`cache.t4g.micro`, ~$0.016/hr) — `make cache-down` before ending a
 session. SSM interface endpoint (~$14/mo, two ENIs) lives in the permanent
 network resources.
+
+---
+
+## Step 5 — the edge (CloudFront + Cache-Control)
+
+Redirect 302 now carries a real `Cache-Control` (`public, max-age=60,
+s-maxage=300`; 404s get `public, max-age=30`) instead of `no-store`. CloudFront
+sits in front with its own cache policy (path-only key, `0/0/3600` TTL) and
+`AllViewerExceptHostHeader`; `/shorten` stays `CachingDisabled`. Domain moved
+from the API Gateway custom domain to CloudFront in two sequential deploys
+(§4), with a real, brief `link123.cfd` outage in between. Paging alarm moved
+to `AWS/CloudFront` `5xxErrorRate`; the old HTTP API alarm stays as an
+origin-level signal.
+
+### Latency — frozen `loadtest.sh` (single hot key), through `link123.cfd`
+
+| Path | p50 | p95 | p99 | status |
+|---|---|---|---|---|
+| `POST /shorten` | 151 ms | 336 ms | 1988 ms | 200× `200` |
+| `GET /{code}` | **6.9 ms** | 7.9 ms | 10.9 ms | 2000× `302` |
+
+Redirect p50 across the five steps: 125 → 129 → 132 → 124 → **6.9 ms**. Steps
+2–4 were all noise around the same API-Gateway/TLS/network floor; the edge
+cache is the first thing in this series that actually moves the number — a
+repeat redirect never reaches API Gateway, Lambda, or DynamoDB at all, so
+there's no backend round trip left to pay for. This is the result the guide
+was building toward: cache the 302 *deliberately* and the latency win finally
+shows up.
+
+### Origin share — same load, measured via CloudWatch (5-min buckets, matching CloudFront's free-tier granularity)
+
+| Workload | CloudFront `Requests` | API GW `Count` | origin share | edge share |
+|---|---|---|---|---|
+| Warm (2000 redirects, 1 key, + 200 creates + 50-code seed) | 2260 | 270 | 12% | **88%** |
+| Many-key burst (100 codes × 30 redirects = 3000, + 100-code reseed creates) | 3104 | 421 | 14% | **86%** |
+
+Origin share = `API Gateway Count ÷ CloudFront Requests` (the free ratio;
+`CacheHitRate` itself needs CloudFront's paid additional metrics). Both
+workloads land in the same 12–14% range even though the burst spans 100
+distinct keys, not one — CloudFront caches per-path, so only the *first* hit
+per key at this edge location has to reach origin; everything after is served
+at the edge regardless of which of the 100 keys it is. Some of the origin
+count in both rows is legitimate non-cacheable traffic (`/shorten` creates,
+`CachingDisabled` by design), not cache misses on the redirect path itself.
+
+**Caveat, same shape as Step 4's single-key one:** every request in this test
+came from one laptop, so it all lands on **one** CloudFront edge location with
+its own cache. Real traffic spans many edge locations, each with its own
+cold-cache first hit — so 86–88% edge share here is optimistic versus
+geographically spread traffic.
+
+### Tier mix at the residual origin traffic (many-key burst, at the Lambda)
+
+| tier | count | share of Lambda invocations |
+|---|---|---|
+| `l1` (in-process) | 37 | 12% |
+| `l2` (Valkey) | 123 | 40% |
+| `miss` (DynamoDB) | 147 | 48% |
+
+Inverted from Step 4's 66% / 26% / 8%. Not a regression in L1/L2 — the
+composition of *what reaches the Lambda at all* changed. Before CloudFront,
+every request hit the Lambda, so L1 (same warm container, same key) dominated.
+Now CloudFront itself absorbs almost all of that repeat-same-key traffic at
+the edge, so what actually reaches the Lambda is disproportionately made up of
+genuine first-touches per key per edge location — exactly the requests L1
+and L2 haven't had a chance to populate for yet. Overall DynamoDB load is
+still down substantially in absolute terms (147 origin reads for ~3000
+redirect attempts, vs. Step 4's 241 for 3000) — the edge and the cache tiers
+are both doing real work, just on different slices of the traffic.
+
+Some origin-reaching count above 100 (the unique-key count) is expected: the
+burst ran 8-way parallel across codes with `-c 3` each, so a handful of
+concurrent requests for the same key could race past the edge cache before
+the first response populated it.
+
+### WAF (§6)
+
+`AWSManagedRulesAmazonIpReputationList` + `AWSManagedRulesKnownBadInputsRuleSet`,
+plus a custom rate-based rule: `POST /shorten`, 100 req/5min/IP (WAFv2's
+minimum allowed value), `Block`. An `IPSet` allow-list (priority 0,
+terminating `Allow`) exempts trusted IPs from the rate limit so `loadtest.sh`
+doesn't trip it — sourced from an SSM `StringList`
+(`/url-shortener/waf-allowed-ips`), not hardcoded in the template. Switchable
+via `EnableWaf` (default `false`) + a `Condition`, so it's a parameter flip
+when idle, not a teardown.
+
+**Block demonstrated, with proof, not just the client-side symptom.** Swapped
+the allow-list to a decoy IP, redeployed, then ran `loadtest.sh` unmodified —
+its own 250-create burst crossed the limit and the seed loop crashed on
+`jq: parse error` because a blocked response's body isn't the Lambda's JSON
+(WAF returns its own page). Confirmed authoritatively via CloudWatch, not just
+inferred from the crash:
+
+```
+AWS/WAFV2 BlockedRequests, WebACL=url-shortener-edge, Rule=url-shortener-rate-limit-shorten
+13:23 → 6 blocked, 13:24 → 1 blocked
+```
+
+**Gotcha: `AWS::WAFv2::IPSet` requires CIDR notation, even for one address.**
+A bare `78.72.66.21` (no `/32`) fails at the WAFv2 API with `"The parameter
+contains formatting that is not valid., field: IP_ADDRESS"` and rolls the
+whole stack update back — `UPDATE_ROLLBACK_COMPLETE`, safely reverted, but the
+failed deploy silently leaves the *previous* IPSet content live (in this case,
+the decoy IP from the block-demo step), not your intended one. Worth checking
+what's actually deployed after any rollback, not just what SSM says — they
+can disagree.
+
+**Not yet done:** the execute-api gap from §6 ("WAF only guards traffic
+through CloudFront; the raw execute-api origin is still public and
+unguarded") — no secret-header check added yet. Decided to leave as a known,
+written gap rather than build it now; revisit if this ever handles real
+traffic.
+
+### Takedown, end to end (§9)
+
+Three links, three runs, to separate the real signal from timing accidents.
+
+**Correctly-ordered takedown SLA: ~5–6 seconds.** Invalidate *after* L1/Valkey's
+60s TTL has genuinely elapsed, and `create-invalidation` → edge `404` lands in
+about 5–6s, twice, independently measured:
+
+| Run | Invalidated at | Confirmed `404` at | Elapsed |
+|---|---|---|---|
+| Key `AEXd04V` (redo) | 12:39:40 | 12:39:46 | ~6s |
+| Key `NV4yYs2` | 12:49:09 | 12:49:15 | ~6s |
+
+**Invalidating too early is a real, reproducible failure mode, not just a
+warning line in the guide — hit it twice, live.** Delete DynamoDB and
+invalidate CloudFront in the same instant, before L1/Valkey's 60s TTL expires,
+and: the edge entry is purged, but the *next* miss re-fetches from origin,
+where L1/Valkey are still warm and serve the **stale, pre-deletion** value
+straight back — they don't check whether the DynamoDB row still exists, only
+whether their own TTL has expired. CloudFront then re-caches that stale 302
+for a **fresh full `s-maxage=300`**. First occurrence: invalidated and deleted
+at the same instant, still serving stale `302` with `Age: 130` two minutes
+later. Second occurrence: invalidated 53s after the original cache fill (7s
+short of the 60s TTL) — stuck another ~70s. Both required a *second*,
+correctly-timed invalidation to actually clear.
+
+**Browser persistence — confirmed with zero ambiguity.** A browser that
+already followed a link keeps re-serving the cached redirect from its own
+local cache, independent of any server-side state:
+
+- Created key `hpBy1jV`, followed it in a real browser tab (cached,
+  `max-age=60`).
+- Deleted its DynamoDB row immediately — no wait, no invalidation yet.
+- Reloaded the *same* browser tab immediately: still redirected to the
+  target. `read_network_requests` for that reload: **zero requests** — the
+  browser never even asked the server; it replayed the cached response
+  entirely locally, while the backing data was already gone.
+
+**Non-obvious finding: the two 60s TTLs (L1/Valkey origin tiers, browser
+`max-age`) collide.** Following the *correct* invalidation procedure (wait
+out the origin TTL, then invalidate) means the browser's own cache has
+usually *also* already expired by the time you're done waiting — under the
+safe procedure, you rarely get to actually witness a live browser outliving a
+real takedown. We only captured it above by invalidating fast on purpose
+(accepting the re-caching risk) specifically to catch the browser side before
+its own window closed. If the browser-persistence behavior needs to be
+demonstrable *and* safe to invalidate immediately after, the origin TTL and
+the browser `max-age` need to be pulled apart, not left at the same value.
+
+### Not yet run
+
+The §8 fork decision is still pending.

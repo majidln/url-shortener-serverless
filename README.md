@@ -1,10 +1,10 @@
 # URL Shortener
 
-A serverless URL shortener on AWS, built with SAM. Go Lambdas behind an HTTP API
-with a custom domain over HTTPS, a DynamoDB table, CloudWatch alarms + a
-synthetic canary, and a two-tier read cache. See [PLANNING.md](PLANNING.md) for
-the step-by-step roadmap; the current step guide is
-[STEP-4-GUIDE.md](STEP-4-GUIDE.md).
+A serverless URL shortener on AWS, built with SAM. Go Lambdas behind CloudFront
++ an HTTP API with a custom domain over HTTPS, a DynamoDB table, CloudWatch
+alarms + a synthetic canary, a two-tier read cache, and an optional WAF Web
+ACL. See [PLANNING.md](PLANNING.md) for the step-by-step roadmap; the current
+step guide is [STEP-5-GUIDE.md](STEP-5-GUIDE.md).
 
 ## Architecture
 
@@ -90,6 +90,48 @@ If the cache stack is absent (never deployed, or `make cache-down`), the SSM
 parameter doesn't exist, `l2` is disabled, and the service runs on L1 +
 DynamoDB. Deleting it never breaks redirects.
 
+## WAF (Step 5)
+
+Off by default — it's the one piece of this stack that costs money for as
+long as it's attached (~$5/mo for the ACL + ~$1/mo per rule). Two managed rule
+groups (`AmazonIpReputationList`, `KnownBadInputsRuleSet`) plus a custom
+rate-based rule: `POST /shorten` is blocked past 100 requests/5min from the
+same IP.
+
+**Turn it on:**
+
+```bash
+sam deploy --parameter-overrides EnableWaf=true
+```
+
+CloudFormation remembers this across future deploys — you don't need to keep
+passing it every time, only when you want to flip it. `sam deploy
+--parameter-overrides EnableWaf=false` turns it back off (a parameter flip,
+not a teardown).
+
+**Allow-list, for your own testing.** The rate limit would otherwise block
+`scripts/loadtest.sh` itself — its default run sends 250 `POST /shorten`
+calls in well under a minute. A `WAFv2::IPSet`, evaluated before the rate
+limit with a terminating `Allow`, exempts specific CIDRs. Its content comes
+from an SSM `StringList`, never hardcoded in the template:
+
+```bash
+aws ssm put-parameter --name /url-shortener/waf-allowed-ips \
+  --type StringList --value "<your-ip>/32"
+```
+
+The `/32` suffix is required — `AWS::WAFv2::IPSet` rejects a bare IP with no
+CIDR prefix and rolls the deploy back. To add more addresses later, overwrite
+the parameter with the full comma-separated list (`"1.2.3.4/32,5.6.7.8/32"`)
+and add `--overwrite`. This only takes effect on the **next** `sam deploy` —
+unlike the redirect Lambda's own SSM reads at cold start, this value resolves
+once, at deploy time, so updating SSM alone does nothing to the live `IPSet`.
+
+**Known gap:** WAF only guards traffic that goes through CloudFront. The raw
+`execute-api` origin URL is still public and unguarded — CloudFront needs it
+as its origin, so it can't be disabled. Not fixed yet; see
+[RESULTS.md](RESULTS.md) Step 5.
+
 ## Endpoints
 
 Base URL: `https://<your-domain>` (the `CustomDomainUrl` output). The
@@ -114,7 +156,7 @@ curl -sX POST "https://<domain>/shorten" \
 curl -si "https://<domain>/aB3xY7z"
 # => HTTP/2 302
 #    location: https://example.com/some/long/path
-#    cache-control: no-store
+#    cache-control: public, max-age=60, s-maxage=300
 ```
 
 `404` if the key was never issued.

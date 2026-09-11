@@ -137,19 +137,42 @@ func TestRedirect(t *testing.T) {
 	}
 }
 
-// The happy path must not be cached: the mapping can still change.
-func TestRedirectIsNotCacheable(t *testing.T) {
+// A redirect carries whatever Cache-Control the handler was configured with
+// (set from env at cold start) — CloudFront and browsers are meant to cache
+// it deliberately now, not the old hardcoded no-store.
+func TestRedirectSendsConfiguredCacheControl(t *testing.T) {
 	f := &fakeGetter{out: &dynamodb.GetItemOutput{
 		Item: item("abc1234", "https://example.com/"),
 	}}
-	h := &handler{ddb: f, table: "test-table"}
+	want := "public, max-age=60, s-maxage=300"
+	h := &handler{ddb: f, table: "test-table", redirectCacheControl: want}
 
 	resp, err := h.Redirect(context.Background(), requestFor("abc1234"))
 	if err != nil {
 		t.Fatalf("Redirect() returned error: %v", err)
 	}
-	if got := resp.Headers["Cache-Control"]; got != "no-store" {
-		t.Errorf("Cache-Control = %q, want %q", got, "no-store")
+	if got := resp.Headers["Cache-Control"]; got != want {
+		t.Errorf("Cache-Control = %q, want %q", got, want)
+	}
+}
+
+// A miss is also cacheable at the edge, briefly, to blunt a scan of random
+// keys — separate from L1/L2/DynamoDB, which never cache a miss (see
+// TestRedirectDoesNotCacheMisses).
+func TestNotFoundSendsConfiguredCacheControl(t *testing.T) {
+	f := &fakeGetter{out: &dynamodb.GetItemOutput{}}
+	want := "public, max-age=30"
+	h := &handler{ddb: f, table: "test-table", notFoundCacheControl: want}
+
+	resp, err := h.Redirect(context.Background(), requestFor("abc1234"))
+	if err != nil {
+		t.Fatalf("Redirect() returned error: %v", err)
+	}
+	if resp.StatusCode != 404 {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+	if got := resp.Headers["Cache-Control"]; got != want {
+		t.Errorf("Cache-Control = %q, want %q", got, want)
 	}
 }
 
