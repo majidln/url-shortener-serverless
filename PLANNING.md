@@ -112,6 +112,17 @@ CloudFront in front, deliberate `Cache-Control`, negative caching, WAF.
 ### Step 6 — Which links are popular? *(optional)*
 No operational trigger. Click analytics from DynamoDB Streams if traffic reaches the origin, CloudFront logs if it doesn't. If it's never built, the project is complete.
 
+### Step 7 — Nobody wants to curl a URL shortener *(optional)*
+No operational trigger either. Everything so far is an API — a real user needs
+a page: create a link, see the short URL, maybe a list of links already made.
+A minimal frontend (static site on S3 behind the existing CloudFront
+distribution, or its own) turns this from a backend exercise into something a
+non-technical person could actually use. Deliberately vague until it's
+picked back up — worth deciding then whether it's a static form calling
+`/shorten` directly, or something with its own login/ownership model, which
+is a much bigger scope change. If it's never built, the project is still
+complete.
+
 ---
 
 ## 4. Session discipline
