@@ -59,14 +59,15 @@ func TestRedirectL2HitPopulatesL1(t *testing.T) {
 	l2 := newFakeL2()
 	l2.getURL = "https://example.com/l2"
 	c := newL1Cache(time.Minute, 10)
-	h := &handler{ddb: f, table: "t", l1: c, l2: l2}
+	want := "public, max-age=60, s-maxage=300"
+	h := &handler{ddb: f, table: "t", l1: c, l2: l2, redirectCacheControl: want}
 
 	resp, _ := h.Redirect(context.Background(), requestFor("abc1234"))
 	if resp.StatusCode != 302 || resp.Headers["Location"] != "https://example.com/l2" {
 		t.Fatalf("got %d %q", resp.StatusCode, resp.Headers["Location"])
 	}
-	if resp.Headers["Cache-Control"] != "no-store" {
-		t.Errorf("Cache-Control = %q, want no-store on the L2 path too", resp.Headers["Cache-Control"])
+	if resp.Headers["Cache-Control"] != want {
+		t.Errorf("Cache-Control = %q, want %q on the L2 path too", resp.Headers["Cache-Control"], want)
 	}
 	if f.calls != 0 {
 		t.Errorf("GetItem called %d times, want 0 (L2 hit)", f.calls)

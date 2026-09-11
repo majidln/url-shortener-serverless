@@ -33,6 +33,18 @@ Parameters:
     Type: AWS::SSM::Parameter::Value<String>
     Default: /url-shortener/slack-channel-id
     Description: Slack channel id for alarm notifications
+  EnableWaf:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Attach the WAF Web ACL to the CloudFront distribution.
+  WafAllowedIps:
+    Type: AWS::SSM::Parameter::Value<List<String>>
+    Default: /url-shortener/waf-allowed-ips
+    Description: CIDR ranges exempted from the /shorten rate limit (comma-separated in SSM)
+
+Conditions:
+  WafOn: !Equals [!Ref EnableWaf, "true"]
 
 Globals:
   Function:
@@ -183,7 +195,7 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-canary"
       RetentionInDays: 14
 
-  # Step 4: turn the redirect handler's `cache` log field (l1 | l2 | miss) into
+  # Turn the redirect handler's `cache` log field (l1 | l2 | miss) into
   # metrics, no API call on the hot path.
   #   overall hit rate = (CacheL1 + CacheL2) / (CacheL1 + CacheL2 + CacheOrigin)
   RedirectCacheL1Filter:
@@ -229,12 +241,202 @@ Resources:
     Type: AWS::Serverless::HttpApi
     Properties:
       StageName: !Ref StageName
-      Domain:
-        DomainName: !Ref DomainName
-        CertificateArn: !Ref Certificate
-        SecurityPolicy: TLS_1_2
-        Route53:
-          HostedZoneId: !Ref HostedZoneId
+  # Cache key is the path only (no query strings/headers/cookies) and
+  # TTLs are 0/0/3600 so CloudFront trusts the origin's Cache-Control instead
+  # of a managed policy's own default (CachingOptimized silently caches a day
+  # when the origin sends nothing — wrong for a service that must be able to
+  # kill a link).
+  RedirectCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub "${AWS::StackName}-redirect"
+        Comment: Cache key is the request path only; TTL comes from the origin's Cache-Control.
+        DefaultTTL: 0
+        MinTTL: 0
+        MaxTTL: 3600
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+
+  # Aliases/ViewerCertificate added per §4 step 2. DNS (the HttpApi Domain
+  # block, below) still points link123.cfd at API Gateway directly, so this
+  # deploy changes nothing for live traffic — it only makes the distribution
+  # *able* to answer for link123.cfd, ahead of the DNS cutover in §4 steps 3-4.
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AWS::StackName} redirect edge"
+        # §6: WebACLAssociation doesn't work for CloudFront (regional
+        # resources only) - a CloudFront-scoped ACL is attached here directly.
+        WebACLId: !If [WafOn, !GetAtt WebAcl.Arn, !Ref AWS::NoValue]
+        Aliases:
+          - !Ref DomainName
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Certificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: HttpApiOrigin
+            DomainName: !Sub "${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+            # Stage is Dev, not $default - without this every request 404s at
+            # API Gateway before it ever reaches the Lambda.
+            OriginPath: !Sub "/${StageName}"
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: HttpApiOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachePolicyId: !Ref RedirectCachePolicy
+          # AllViewerExceptHostHeader (managed). Forwarding the viewer's literal
+          # Host: link123.cfd straight to execute-api makes API Gateway 403 -
+          # it only routes requests addressed to itself.
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        CacheBehaviors:
+          - PathPattern: /shorten
+            TargetOriginId: HttpApiOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            # CloudFront only offers three method sets; POST forces "all seven".
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            # CachingDisabled (managed) - always pass through, never cached.
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        CustomErrorResponses:
+          # CloudFront's own default is 10s for these; a stuck origin blip
+          # shouldn't stay pinned at the edge after it recovers.
+          - ErrorCode: 500
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 502
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 503
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 504
+            ErrorCachingMinTTL: 0
+
+  # Content comes from SSM (WafAllowedIps), never hardcoded here - update
+  # the SSM StringList and redeploy to add/remove an address.
+  WafAllowedIpSet:
+    Type: AWS::WAFv2::IPSet
+    Condition: WafOn
+    Properties:
+      Name: !Sub "${AWS::StackName}-waf-allowed-ips"
+      Scope: CLOUDFRONT
+      IPAddressVersion: IPV4
+      Addresses: !Ref WafAllowedIps
+
+  # Scope: CLOUDFRONT requires us-east-1 - already true here.
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Condition: WafOn
+    Properties:
+      Name: !Sub "${AWS::StackName}-edge"
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${AWS::StackName}-edge"
+      Rules:
+        - Name: AllowListedIps
+          Priority: 0
+          Action:
+            Allow: {}
+          Statement:
+            IPSetReferenceStatement:
+              Arn: !GetAtt WafAllowedIpSet.Arn
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${AWS::StackName}-allow-listed-ips"
+        - Name: AmazonIpReputationList
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${AWS::StackName}-ip-reputation"
+        - Name: KnownBadInputs
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${AWS::StackName}-known-bad-inputs"
+        - Name: RateLimitShorten
+          Priority: 3
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 100
+              AggregateKeyType: IP
+              ScopeDownStatement:
+                AndStatement:
+                  Statements:
+                    - ByteMatchStatement:
+                        SearchString: /shorten
+                        FieldToMatch:
+                          UriPath: {}
+                        TextTransformations:
+                          - Priority: 0
+                            Type: NONE
+                        PositionalConstraint: EXACTLY
+                    - ByteMatchStatement:
+                        SearchString: POST
+                        FieldToMatch:
+                          Method: {}
+                        TextTransformations:
+                          - Priority: 0
+                            Type: NONE
+                        PositionalConstraint: EXACTLY
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${AWS::StackName}-rate-limit-shorten"
+
+  RedirectDnsRecordA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+  RedirectDnsRecordAAAA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
   UrlTable:
     Type: AWS::Serverless::SimpleTable
     DeletionPolicy: Delete
@@ -465,6 +667,38 @@ Resources:
       OKActions:
         - !Ref AlarmTopic
 
+  # The front door moved to CloudFront, which now absorbs most traffic -
+  # Http5xxRateAlarm above only sees edge misses. This catches failures (cert,
+  # cache behavior, origin unreachable, a WAF misfire once §6 adds it) that
+  # never reach API Gateway at all. 5xxErrorRate is a free metric already
+  # expressed as a percentage, but only published at 5-minute granularity
+  # without CloudFront's paid "additional metrics" - reacts slower than
+  # Http5xxRateAlarm by design, not an oversight.
+  CloudFront5xxRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-cloudfront-5xx-rate"
+      AlarmDescription: >-
+        CloudFront edge 5xx rate over 5% for 2 of 3 five-minute periods.
+      Namespace: AWS/CloudFront
+      MetricName: 5xxErrorRate
+      Dimensions:
+        - Name: DistributionId
+          Value: !Ref CloudFrontDistribution
+        - Name: Region
+          Value: Global
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
   Dashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:
@@ -475,13 +709,15 @@ Resources:
             {
               "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
               "properties": {
-                "title": "HTTP API - traffic & errors",
-                "region": "${AWS::Region}", "period": 60, "stat": "Sum",
+                "title": "CloudFront - edge traffic & error rate %",
+                "region": "us-east-1", "period": 300,
                 "metrics": [
-                  [ "AWS/ApiGateway", "Count", "ApiId", "${HttpApi}" ],
-                  [ "AWS/ApiGateway", "4xx", "ApiId", "${HttpApi}" ],
-                  [ "AWS/ApiGateway", "5xx", "ApiId", "${HttpApi}" ]
-                ]
+                  [ "AWS/CloudFront", "Requests", "DistributionId", "${CloudFrontDistribution}", "Region", "Global", { "stat": "Sum", "yAxis": "left", "label": "Requests" } ],
+                  [ "AWS/CloudFront", "4xxErrorRate", "DistributionId", "${CloudFrontDistribution}", "Region", "Global", { "stat": "Average", "yAxis": "right", "label": "4xx %" } ],
+                  [ "AWS/CloudFront", "5xxErrorRate", "DistributionId", "${CloudFrontDistribution}", "Region", "Global", { "stat": "Average", "yAxis": "right", "label": "5xx %" } ]
+                ],
+                "yAxis": { "right": { "min": 0 } },
+                "annotations": { "horizontal": [ { "label": "alarm at 5%", "value": 5, "yAxis": "right" } ] }
               }
             },
             {
@@ -564,7 +800,7 @@ Resources:
               "type": "alarm", "x": 8, "y": 18, "width": 16, "height": 6,
               "properties": {
                 "title": "Alarms",
-                "alarms": [ "${Http5xxRateAlarm.Arn}", "${CanaryAlarm.Arn}" ]
+                "alarms": [ "${Http5xxRateAlarm.Arn}", "${CanaryAlarm.Arn}", "${CloudFront5xxRateAlarm.Arn}" ]
               }
             },
             {
@@ -592,6 +828,9 @@ Outputs:
   CustomDomainUrl:
     Description: "HTTPS URL for the redirect service on the custom domain"
     Value: !Sub "https://${DomainName}/"
+  CloudFrontDomainName:
+    Description: "CloudFront's own domain - test through this before the DNS move (§4)"
+    Value: !GetAtt CloudFrontDistribution.DomainName
   UrlShortenerApi:
     Description: "API Gateway endpoint URL for Prod stage for Url Shortener function"
     Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/"
@@ -614,8 +853,11 @@ Outputs:
     Description: "CloudWatch dashboard — the diagnosis surface"
     Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/${AWS::StackName}"
   Http5xxAlarmName:
-    Description: "Front-door paging alarm (HTTP API 5xx rate); also gates redirect deploys"
+    Description: "Origin-level alarm (HTTP API 5xx rate, edge-miss traffic only); also gates redirect deploys"
     Value: !Ref Http5xxRateAlarm
+  CloudFrontAlarmName:
+    Description: "Front-door paging alarm (CloudFront edge 5xx rate) - §7, the front door moved here"
+    Value: !Ref CloudFront5xxRateAlarm
   CanaryAlarmName:
     Description: "Synthetic canary watchdog; also gates redirect deploys"
     Value: !Ref CanaryAlarm

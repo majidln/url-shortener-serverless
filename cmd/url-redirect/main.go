@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
@@ -27,6 +28,11 @@ type handler struct {
 	table string
 	l1    *l1Cache // in-process, per execution environment. nil disables it.
 	l2    l2Cache  // shared Valkey. nil = cache stack absent, run on l1 + DynamoDB.
+
+	// Cache-Control sent on a successful redirect (302) and on a miss (404).
+	// CloudFront and browsers both honor these; DynamoDB is empty strings.
+	redirectCacheControl string
+	notFoundCacheControl string
 }
 
 func errorResponse(status int, message string) events.APIGatewayV2HTTPResponse {
@@ -37,14 +43,23 @@ func errorResponse(status int, message string) events.APIGatewayV2HTTPResponse {
 	}
 }
 
-func redirect(url string) events.APIGatewayV2HTTPResponse {
+func notFoundResponse(cacheControl string) events.APIGatewayV2HTTPResponse {
+	return events.APIGatewayV2HTTPResponse{
+		StatusCode: 404,
+		Headers: map[string]string{
+			"Content-Type":  "text/plain; charset=utf-8",
+			"Cache-Control": cacheControl,
+		},
+		Body: "not found",
+	}
+}
+
+func redirect(url, cacheControl string) events.APIGatewayV2HTTPResponse {
 	return events.APIGatewayV2HTTPResponse{
 		StatusCode: 302,
 		Headers: map[string]string{
-			"Location": url,
-			// Keep the redirect out of downstream caches while the mapping can
-			// still change. Our own tiers' staleness is bounded by their TTL.
-			"Cache-Control": "no-store",
+			"Location":      url,
+			"Cache-Control": cacheControl,
 		},
 	}
 }
@@ -67,7 +82,7 @@ func (h *handler) Redirect(
 	if h.l1 != nil {
 		if url, ok := h.l1.Get(key); ok {
 			log.Info("redirecting", "key", key, "url", url, "cache", "l1")
-			return redirect(url), nil
+			return redirect(url, h.redirectCacheControl), nil
 		}
 	}
 
@@ -81,7 +96,7 @@ func (h *handler) Redirect(
 				h.l1.Put(key, url)
 			}
 			log.Info("redirecting", "key", key, "url", url, "cache", "l2")
-			return redirect(url), nil
+			return redirect(url, h.redirectCacheControl), nil
 		case errors.Is(err, errL2Miss):
 			// fall through to DynamoDB
 		default:
@@ -100,11 +115,12 @@ func (h *handler) Redirect(
 		return errorResponse(500, "internal error"), nil
 	}
 
-	// No item means the key was never issued, or was deleted. Misses are not
-	// cached — negative caching is a Step 5 decision.
+	// No item means the key was never issued, or was deleted. Not cached in our
+	// own tiers (L1/L2/DynamoDB stays authoritative), but briefly cacheable at
+	// the edge via notFoundCacheControl to blunt a scan of random keys.
 	if len(out.Item) == 0 {
 		log.Info("key not found", "key", key)
-		return errorResponse(404, "not found"), nil
+		return notFoundResponse(h.notFoundCacheControl), nil
 	}
 
 	// Stored as a string attribute by url-shortener.
@@ -123,7 +139,7 @@ func (h *handler) Redirect(
 	}
 
 	log.Info("redirecting", "key", key, "url", urlAttr.Value, "cache", "miss")
-	return redirect(urlAttr.Value), nil
+	return redirect(urlAttr.Value, h.redirectCacheControl), nil
 }
 
 // cacheConfigFromEnv reads CACHE_TTL_SECONDS (default 60) and CACHE_MAX_ENTRIES
@@ -141,6 +157,33 @@ func cacheConfigFromEnv() (time.Duration, int) {
 	return ttl, max
 }
 
+// redirectCacheControlFromEnv builds the Cache-Control for a successful
+// redirect from REDIRECT_MAX_AGE_SECONDS (browser, default 60) and
+// REDIRECT_S_MAXAGE_SECONDS (CloudFront, default 300). CloudFront can be
+// purged with an invalidation; a browser can't, so it gets the shorter TTL.
+func redirectCacheControlFromEnv() string {
+	maxAge := 60
+	if v, err := strconv.Atoi(os.Getenv("REDIRECT_MAX_AGE_SECONDS")); err == nil {
+		maxAge = v
+	}
+	sMaxAge := 300
+	if v, err := strconv.Atoi(os.Getenv("REDIRECT_S_MAXAGE_SECONDS")); err == nil {
+		sMaxAge = v
+	}
+	return fmt.Sprintf("public, max-age=%d, s-maxage=%d", maxAge, sMaxAge)
+}
+
+// notFoundCacheControlFromEnv builds the Cache-Control for a miss from
+// NOT_FOUND_MAX_AGE_SECONDS (default 30). Kept short: a key probed as a 404
+// just before it's created would otherwise stay negatively cached too long.
+func notFoundCacheControlFromEnv() string {
+	maxAge := 30
+	if v, err := strconv.Atoi(os.Getenv("NOT_FOUND_MAX_AGE_SECONDS")); err == nil {
+		maxAge = v
+	}
+	return fmt.Sprintf("public, max-age=%d", maxAge)
+}
+
 func main() {
 	// Built here rather than in init() so tests never touch the AWS SDK.
 	cfg, err := config.LoadDefaultConfig(context.Background())
@@ -153,10 +196,12 @@ func main() {
 
 	ttl, max := cacheConfigFromEnv()
 	h := &handler{
-		ddb:   dynamodb.NewFromConfig(cfg),
-		table: os.Getenv("URL_TABLE_NAME"),
-		l1:    newL1Cache(ttl, max),
-		l2:    newL2FromSSM(context.Background(), cfg, ttl),
+		ddb:                  dynamodb.NewFromConfig(cfg),
+		table:                os.Getenv("URL_TABLE_NAME"),
+		l1:                   newL1Cache(ttl, max),
+		l2:                   newL2FromSSM(context.Background(), cfg, ttl),
+		redirectCacheControl: redirectCacheControlFromEnv(),
+		notFoundCacheControl: notFoundCacheControlFromEnv(),
 	}
 	lambda.Start(h.Redirect)
 }
