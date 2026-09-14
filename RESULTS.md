@@ -386,7 +386,7 @@ AWS/WAFV2 BlockedRequests, WebACL=url-shortener-edge, Rule=url-shortener-rate-li
 ```
 
 **Gotcha: `AWS::WAFv2::IPSet` requires CIDR notation, even for one address.**
-A bare `78.72.66.21` (no `/32`) fails at the WAFv2 API with `"The parameter
+A bare `IP_ADDRESS` (no `/32`) fails at the WAFv2 API with `"The parameter
 contains formatting that is not valid., field: IP_ADDRESS"` and rolls the
 whole stack update back — `UPDATE_ROLLBACK_COMPLETE`, safely reverted, but the
 failed deploy silently leaves the *previous* IPSet content live (in this case,
