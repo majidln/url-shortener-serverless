@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/hero.svg" alt="Many long strands converging into one short point, ringed by cache tiers" width="100%">
+</p>
+
 # URL Shortener
 
 A serverless URL shortener on AWS, built with SAM. Go Lambdas behind CloudFront
