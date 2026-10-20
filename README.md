@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="assets/hero.svg" alt="Many long strands converging into one short point, ringed by cache tiers" width="100%">
-</p>
+![Abstract banner: three layered ridges under a connected night sky, with a glowing trail winding up toward the sunrise](docs/banner.svg)
 
 # URL Shortener
 
@@ -8,7 +6,7 @@ A serverless URL shortener on AWS, built with SAM. Go Lambdas behind CloudFront
 + an HTTP API with a custom domain over HTTPS, a DynamoDB table, CloudWatch
 alarms + a synthetic canary, a two-tier read cache, and an optional WAF Web
 ACL. See [PLANNING.md](PLANNING.md) for the step-by-step roadmap; the current
-step guide is [STEP-5-GUIDE.md](STEP-5-GUIDE.md).
+step guide is [STEP-5-GUIDE.md](docs/STEP-5-GUIDE.md).
 
 ## Architecture
 

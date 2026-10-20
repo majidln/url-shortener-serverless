@@ -3,7 +3,7 @@
 A coaching guide, not a code drop. It names what to build and why; you write the
 YAML.
 
-**Goal (from [PLANNING.md](PLANNING.md)):** put a real domain in front of the
+**Goal (from [PLANNING.md](../PLANNING.md)):** put a real domain in front of the
 `execute-api` URL, over HTTPS.
 
 **Exit:** `https://<your-domain>/<code>` returns the `302`. Nothing else changes.

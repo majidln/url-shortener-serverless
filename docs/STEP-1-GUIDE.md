@@ -2,7 +2,7 @@
 
 A coaching guide, not a code drop. It names what to build and why; you write the Go and the YAML.
 
-**Goal (from [PLANNING.md](PLANNING.md)):** POST a URL, get a code. GET the code, get a redirect. Three Lambdas, one HTTP API, one DynamoDB table.
+**Goal (from [PLANNING.md](../PLANNING.md)):** POST a URL, get a code. GET the code, get a redirect. Three Lambdas, one HTTP API, one DynamoDB table.
 
 ---
 

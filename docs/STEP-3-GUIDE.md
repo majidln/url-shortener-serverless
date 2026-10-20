@@ -3,7 +3,7 @@
 A coaching guide, not a code drop. It names what to build and why; you write the
 YAML.
 
-**Goal (from [PLANNING.md](PLANNING.md)):** a bad deploy broke redirects and you
+**Goal (from [PLANNING.md](../PLANNING.md)):** a bad deploy broke redirects and you
 found out by clicking a link yourself. Add observability and safe deploys so the
 system tells you first — and rolls a bad deploy back on its own.
 

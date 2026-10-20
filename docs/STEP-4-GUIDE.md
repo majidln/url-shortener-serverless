@@ -3,7 +3,7 @@
 A coaching guide, not a code drop. It names what to build and why; you write the
 Go and the YAML.
 
-**Goal (from [PLANNING.md](PLANNING.md)):** every redirect invokes a Lambda and
+**Goal (from [PLANNING.md](../PLANNING.md)):** every redirect invokes a Lambda and
 crosses a region for a value that never changes. Add caching — in-memory first,
 then a shared cache — and measure what each layer actually buys.
 

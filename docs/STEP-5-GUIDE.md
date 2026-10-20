@@ -3,7 +3,7 @@
 A coaching guide, not a code drop. It names what to build and why; you write the
 YAML and the Go.
 
-**Goal (from [PLANNING.md](PLANNING.md)):** redirects still round-trip to
+**Goal (from [PLANNING.md](../PLANNING.md)):** redirects still round-trip to
 `us-east-1` for a value that almost never changes, and the service is public
 enough to be abused. Put CloudFront in front, cache redirects *deliberately*,
 cache misses too, and put WAF on the front door.

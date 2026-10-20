@@ -49,7 +49,7 @@ Four constraints keep it reusable:
 ## 3. Steps
 
 ### Step 1 — Make it work
-Three Lambdas, HTTP API, DynamoDB table. See [STEP-1-GUIDE.md](STEP-1-GUIDE.md).
+Three Lambdas, HTTP API, DynamoDB table. See [STEP-1-GUIDE.md](docs/STEP-1-GUIDE.md).
 
 **Exit:** POST a URL, get a code; GET the code, get a redirect. Collision path forced and proven (shorten the key to 1–2 chars and hammer it). Generator's role has no DynamoDB permissions — check the role, not the code. Unit tests for `key-generator` pass with no AWS mocking; if mocking is needed, it isn't pure. Baseline recorded, cold and warm.
 
