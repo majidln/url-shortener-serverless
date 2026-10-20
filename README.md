@@ -1,4 +1,4 @@
-![Abstract banner: three layered ridges under a connected night sky, with a glowing trail winding up toward the sunrise](docs/banner.svg)
+![Abstract illustration: many long strands converging into a single short point surrounded by concentric cache rings](docs/hero.svg)
 
 # URL Shortener
 
