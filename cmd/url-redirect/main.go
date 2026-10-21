@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -23,11 +25,27 @@ type dynamoGetter interface {
 	GetItem(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
 }
 
+// keyLength and keyAlphabet mirror key-generator. Duplicated on purpose: the
+// functions are separate modules and the key format is the contract between them.
+const (
+	keyLength   = 7
+	keyAlphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+)
+
+// originSecretHeader is added by CloudFront to every request it forwards. API
+// Gateway lowercases header names in the event.
+const originSecretHeader = "x-origin-verify"
+
 type handler struct {
 	ddb   dynamoGetter
 	table string
-	l1    *l1Cache // in-process, per execution environment. nil disables it.
-	l2    l2Cache  // shared Valkey. nil = cache stack absent, run on l1 + DynamoDB.
+
+	// Shared secret CloudFront sends in originSecretHeader. Empty disables the
+	// check (local runs and tests); the template always sets it when enforcing.
+	originSecret string
+
+	l1 *l1Cache // in-process, per execution environment. nil disables it.
+	l2 l2Cache  // shared Valkey. nil = cache stack absent, run on l1 + DynamoDB.
 
 	// Cache-Control sent on a successful redirect (302) and on a miss (404).
 	// CloudFront and browsers both honor these; DynamoDB is empty strings.
@@ -64,6 +82,31 @@ func redirect(url, cacheControl string) events.APIGatewayV2HTTPResponse {
 	}
 }
 
+// validKey reports whether key could have been issued by key-generator. Anything
+// else (/favicon.ico, scans, oversized paths) cannot be in the table, so it is
+// answered without touching either cache or DynamoDB.
+func validKey(key string) bool {
+	if len(key) != keyLength {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		if !strings.ContainsRune(keyAlphabet, rune(key[i])) {
+			return false
+		}
+	}
+	return true
+}
+
+// fromEdge reports whether the request carries the secret CloudFront adds. It
+// is what keeps the raw execute-api URL from bypassing the WAF.
+func (h *handler) fromEdge(request events.APIGatewayV2HTTPRequest) bool {
+	if h.originSecret == "" {
+		return true
+	}
+	got := request.Headers[originSecretHeader]
+	return subtle.ConstantTimeCompare([]byte(got), []byte(h.originSecret)) == 1
+}
+
 func (h *handler) Redirect(
 	ctx context.Context,
 	request events.APIGatewayV2HTTPRequest,
@@ -71,11 +114,20 @@ func (h *handler) Redirect(
 	// Tags every line below, so one request is greppable end to end.
 	log := slog.With("request_id", request.RequestContext.RequestID)
 
+	if !h.fromEdge(request) {
+		log.Warn("request did not come through the edge")
+		return errorResponse(403, "forbidden"), nil
+	}
+
 	// Comes from the {key} in the route path.
 	key := request.PathParameters["key"]
 	if key == "" {
 		log.Warn("no key in path")
 		return errorResponse(400, "key is required"), nil
+	}
+	if !validKey(key) {
+		log.Info("key is not a valid key", "length", len(key))
+		return notFoundResponse(h.notFoundCacheControl), nil
 	}
 
 	// L1: in-process. A hit skips both Valkey and DynamoDB.
@@ -198,6 +250,7 @@ func main() {
 	h := &handler{
 		ddb:                  dynamodb.NewFromConfig(cfg),
 		table:                os.Getenv("URL_TABLE_NAME"),
+		originSecret:         os.Getenv("ORIGIN_SECRET"),
 		l1:                   newL1Cache(ttl, max),
 		l2:                   newL2FromSSM(context.Background(), cfg, ttl),
 		redirectCacheControl: redirectCacheControlFromEnv(),

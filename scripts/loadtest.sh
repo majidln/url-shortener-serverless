@@ -7,7 +7,8 @@
 # measurement aids and may evolve.
 #
 # Usage:
-#   BASE_URL=https://xxxx.execute-api.us-east-1.amazonaws.com/Dev ./loadtest.sh [seed_count]
+#   BASE_URL=https://<your-domain> ./loadtest.sh [seed_count]
+#   (the raw execute-api URL rejects requests once EnforceOriginSecret=true)
 #   SEED_ONLY=1 ./loadtest.sh 100    # reseed /tmp code list, skip the load
 #   COLD=1     ./loadtest.sh         # cold sample: needs codes already seeded
 #                                    # AND ~15 min of no traffic first

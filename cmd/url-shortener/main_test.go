@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -373,5 +374,122 @@ func TestShortenRegeneratesOnCollision(t *testing.T) {
 	stored := p.got[2].Item["key"].(*ddbtypes.AttributeValueMemberS).Value
 	if stored != "free123" {
 		t.Errorf("stored key = %q, want %q", stored, "free123")
+	}
+}
+
+func TestValidateURL(t *testing.T) {
+	cases := []struct {
+		name    string
+		url     string
+		wantErr bool
+	}{
+		{"https", "https://example.com/a?b=1", false},
+		{"http", "http://example.com", false},
+		{"uppercase scheme", "HTTPS://example.com/", false},
+		{"with port and fragment", "https://example.com:8443/a#frag", false},
+		{"ip host", "http://10.0.0.1/health", false},
+		{"javascript scheme", "javascript:alert(1)", true},
+		{"data scheme", "data:text/html,<script>alert(1)</script>", true},
+		{"file scheme", "file:///etc/passwd", true},
+		{"ftp scheme", "ftp://example.com/file", true},
+		{"no scheme", "example.com/path", true},
+		{"scheme relative", "//example.com/path", true},
+		{"no host", "https:///path", true},
+		{"scheme only", "https://", true},
+		{"embedded credentials", "https://trusted.com@evil.com/", true},
+		{"username only", "https://user@example.com/", true},
+		{"contains a space", "https://example.com/a b", true},
+		{"contains a newline", "https://example.com/\r\nSet-Cookie: x=1", true},
+		{"contains a tab", "https://example.com/\t", true},
+		{"contains a null byte", "https://example.com/\x00", true},
+		{"not parseable", "https://exa mple.com", true},
+		{"at the length limit", "https://example.com/" + strings.Repeat("a", maxURLLength-len("https://example.com/")), false},
+		{"over the length limit", "https://example.com/" + strings.Repeat("a", maxURLLength), true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateURL(c.url)
+			if c.wantErr && err == nil {
+				t.Errorf("validateURL(%q) = nil, want an error", c.url)
+			}
+			if !c.wantErr && err != nil {
+				t.Errorf("validateURL(%q) = %v, want nil", c.url, err)
+			}
+		})
+	}
+}
+
+// A rejected URL must come back as a 400 before we spend a Lambda invoke or a
+// write on it, and must never be stored.
+func TestShortenRejectsUnsafeURLs(t *testing.T) {
+	for _, bad := range []string{
+		`javascript:alert(1)`,
+		`file:///etc/passwd`,
+		`example.com`,
+		`https://trusted.com@evil.com/`,
+	} {
+		t.Run(bad, func(t *testing.T) {
+			f := &fakeKeygen{keys: []string{"abc1234"}}
+			p := &fakePutter{}
+			h := &handler{keygen: f, ddb: p, tableName: testTable, keyGeneratorARN: testARN}
+
+			resp, err := h.Shorten(context.Background(), jsonBody(`{"url":"`+bad+`"}`))
+			if err != nil {
+				t.Fatalf("Shorten() returned error: %v", err)
+			}
+			if resp.StatusCode != 400 {
+				t.Errorf("status = %d, want 400", resp.StatusCode)
+			}
+			if f.calls != 0 || p.calls != 0 {
+				t.Errorf("keygen calls = %d, PutItem calls = %d, want 0 and 0", f.calls, p.calls)
+			}
+		})
+	}
+}
+
+func TestShortenOriginSecret(t *testing.T) {
+	const secret = "s3cr3t-value"
+	withHeader := func(v string) events.APIGatewayV2HTTPRequest {
+		r := jsonBody(`{"url":"https://example.com/"}`)
+		r.Headers = map[string]string{originSecretHeader: v}
+		return r
+	}
+
+	cases := []struct {
+		name       string
+		secret     string
+		request    events.APIGatewayV2HTTPRequest
+		wantStatus int
+		wantWork   bool // whether the key-generator should have been called
+	}{
+		{"check disabled, no header", "", jsonBody(`{"url":"https://example.com/"}`), 200, true},
+		{"correct secret", secret, withHeader(secret), 200, true},
+		{"header missing", secret, jsonBody(`{"url":"https://example.com/"}`), 403, false},
+		{"wrong secret", secret, withHeader("nope"), 403, false},
+		{"empty header", secret, withHeader(""), 403, false},
+		{"secret with a suffix", secret, withHeader(secret + "x"), 403, false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := &fakeKeygen{keys: []string{"abc1234"}}
+			p := &fakePutter{}
+			h := &handler{keygen: f, ddb: p, tableName: testTable, keyGeneratorARN: testARN, originSecret: c.secret}
+
+			resp, err := h.Shorten(context.Background(), c.request)
+			if err != nil {
+				t.Fatalf("Shorten() returned error: %v", err)
+			}
+			if resp.StatusCode != c.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, c.wantStatus)
+			}
+			if got := f.calls > 0; got != c.wantWork {
+				t.Errorf("key-generator called = %v, want %v", got, c.wantWork)
+			}
+			if !c.wantWork && p.calls != 0 {
+				t.Errorf("PutItem called %d times on a forbidden request", p.calls)
+			}
+		})
 	}
 }

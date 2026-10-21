@@ -43,8 +43,26 @@ Parameters:
     Default: /url-shortener/waf-allowed-ips
     Description: CIDR ranges exempted from the /shorten rate limit (comma-separated in SSM)
 
+  OriginSecret:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /url-shortener/origin-secret
+    Description: >-
+      Shared secret CloudFront sends to the origin in X-Origin-Verify. Create it
+      once, e.g. with `openssl rand -hex 32`. It is a plain String parameter, so
+      it is visible in the CloudFormation console and the Lambda configuration;
+      treat it as a speed bump for the execute-api URL, not as a credential.
+  EnforceOriginSecret:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Make the Lambdas reject requests without the origin secret (403). Deploy
+      once with "false" so CloudFront starts sending the header, then flip it to
+      "true". Doing both in one deploy risks 403s while the edge config propagates.
+
 Conditions:
   WafOn: !Equals [!Ref EnableWaf, "true"]
+  EnforceSecret: !Equals [!Ref EnforceOriginSecret, "true"]
 
 Globals:
   Function:
@@ -79,6 +97,7 @@ Resources:
         Variables:
           KEY_GENERATOR_FUNCTION_ARN: !GetAtt KeyGeneratorFunction.Arn
           URL_TABLE_NAME: !Ref UrlTable
+          ORIGIN_SECRET: !If [EnforceSecret, !Ref OriginSecret, ""]
       Policies:
         - LambdaInvokePolicy:
             FunctionName: !Ref KeyGeneratorFunction
@@ -112,6 +131,7 @@ Resources:
       Environment:
         Variables:
           URL_TABLE_NAME: !Ref UrlTable
+          ORIGIN_SECRET: !If [EnforceSecret, !Ref OriginSecret, ""]
           CACHE_TTL_SECONDS: "60"
           CACHE_MAX_ENTRIES: "5000"
           # L2: read at cold start. If the cache stack isn't deployed this
@@ -132,6 +152,9 @@ Resources:
             Method: GET
             Path: /{key}
       AutoPublishAlias: live
+      # Without this, SAM only publishes a new version when the code changes, so a
+      # config-only change (an env var) lands on $LATEST and the alias never sees it.
+      AutoPublishAliasAllProperties: true
       DeploymentPreference:
         Type: Canary10Percent5Minutes
         Alarms:
@@ -290,6 +313,11 @@ Resources:
             # Stage is Dev, not $default - without this every request 404s at
             # API Gateway before it ever reaches the Lambda.
             OriginPath: !Sub "/${StageName}"
+            # The Lambdas reject requests without this (EnforceOriginSecret), so
+            # the raw execute-api URL cannot be used to get around the WAF.
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Ref OriginSecret
             CustomOriginConfig:
               OriginProtocolPolicy: https-only
               OriginSSLProtocols: [TLSv1.2]

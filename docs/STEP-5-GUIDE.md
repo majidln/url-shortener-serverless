@@ -176,6 +176,12 @@ The `execute-api` URL is still public and unguarded. You can't set
 secret header CloudFront adds to origin requests and the handler checks (403
 otherwise). Cheap; decide it deliberately.
 
+*Implemented:* `X-Origin-Verify` from the `/url-shortener/origin-secret` SSM
+parameter, checked by `url-shortener` and `url-redirect`. Roll it out in two
+deploys: first with `EnforceOriginSecret=false` (the edge starts sending the
+header), then `true` (the functions start rejecting). Afterwards, load-test and
+call the API through the custom domain, not the raw `execute-api` URL.
+
 ---
 
 ## 7. What the edge breaks
