@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	neturl "net/url"
 	"os"
 	"time"
 
@@ -24,6 +26,14 @@ import (
 // 62^7 (~3.5e12), so a collision is rare; several in a row means the table is
 // near-full or the generator is broken — fail loudly rather than loop forever.
 const maxKeyAttempts = 5
+
+// maxURLLength caps what we are willing to store and later send back in a
+// Location header.
+const maxURLLength = 2048
+
+// originSecretHeader is added by CloudFront to every request it forwards. API
+// Gateway lowercases header names in the event.
+const originSecretHeader = "x-origin-verify"
 
 type ShortenRequest struct {
 	URL string `json:"url"`
@@ -51,6 +61,10 @@ type handler struct {
 	ddb             urlPutter
 	tableName       string
 	keyGeneratorARN string
+
+	// Shared secret CloudFront sends in originSecretHeader. Empty disables the
+	// check (local runs and tests); the template always sets it when enforcing.
+	originSecret string
 }
 
 func badRequest(message string) events.APIGatewayV2HTTPResponse {
@@ -61,12 +75,63 @@ func badRequest(message string) events.APIGatewayV2HTTPResponse {
 	}
 }
 
+func forbidden() events.APIGatewayV2HTTPResponse {
+	return events.APIGatewayV2HTTPResponse{
+		StatusCode: 403,
+		Headers:    map[string]string{"Content-Type": "application/json"},
+		Body:       `{"error":"forbidden"}`,
+	}
+}
+
+// fromEdge reports whether the request carries the secret CloudFront adds. It
+// is what keeps the raw execute-api URL from bypassing the WAF.
+func (h *handler) fromEdge(request events.APIGatewayV2HTTPRequest) bool {
+	if h.originSecret == "" {
+		return true
+	}
+	got := request.Headers[originSecretHeader]
+	return subtle.ConstantTimeCompare([]byte(got), []byte(h.originSecret)) == 1
+}
+
+// validateURL accepts only absolute http(s) URLs with a host and no embedded
+// credentials. Anything else is a way to turn the redirect into a javascript:
+// or file: link, or a host-spoofing "https://trusted.com@evil.com" link.
+func validateURL(raw string) error {
+	if len(raw) > maxURLLength {
+		return fmt.Errorf("url is too long (max %d characters)", maxURLLength)
+	}
+	for _, r := range raw {
+		if r <= ' ' || r == 0x7f {
+			return errors.New("url must not contain spaces or control characters")
+		}
+	}
+	u, err := neturl.Parse(raw)
+	if err != nil {
+		return errors.New("url is not valid")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return errors.New("url must start with http:// or https://")
+	}
+	if u.Hostname() == "" {
+		return errors.New("url must include a host")
+	}
+	if u.User != nil {
+		return errors.New("url must not contain a username or password")
+	}
+	return nil
+}
+
 func (h *handler) Shorten(
 	ctx context.Context,
 	request events.APIGatewayV2HTTPRequest,
 ) (events.APIGatewayV2HTTPResponse, error) {
 	// Tags every line below, so one request is greppable end to end.
 	log := slog.With("request_id", request.RequestContext.RequestID)
+
+	if !h.fromEdge(request) {
+		log.Warn("request did not come through the edge")
+		return forbidden(), nil
+	}
 
 	body := request.Body
 	if request.IsBase64Encoded {
@@ -86,6 +151,10 @@ func (h *handler) Shorten(
 	if req.URL == "" {
 		log.Warn("url missing from body")
 		return badRequest("url is required"), nil
+	}
+	if err := validateURL(req.URL); err != nil {
+		log.Warn("url rejected", "reason", err.Error())
+		return badRequest(err.Error()), nil
 	}
 
 	log.Info("shorten requested", "url", req.URL)
@@ -207,6 +276,7 @@ func main() {
 		ddb:             dynamodb.NewFromConfig(cfg),
 		tableName:       os.Getenv("URL_TABLE_NAME"),
 		keyGeneratorARN: os.Getenv("KEY_GENERATOR_FUNCTION_ARN"),
+		originSecret:    os.Getenv("ORIGIN_SECRET"),
 	}
 	lambda.Start(h.Shorten)
 }

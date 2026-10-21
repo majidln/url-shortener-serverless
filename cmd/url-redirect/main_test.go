@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -273,5 +274,113 @@ func TestRedirectDoesNotCacheMisses(t *testing.T) {
 	}
 	if f.calls != 2 {
 		t.Errorf("GetItem calls = %d, want 2 (the 404 was not cached)", f.calls)
+	}
+}
+
+func TestValidKey(t *testing.T) {
+	cases := []struct {
+		key  string
+		want bool
+	}{
+		{"abc1234", true},
+		{"ABCdefG", true},
+		{"0000000", true},
+		{"zZ9aA0m", true},
+		{"", false},
+		{"abc123", false},      // too short
+		{"abc12345", false},    // too long
+		{"favicon.ico", false}, // the usual browser probe
+		{"abc-123", false},     // right length, wrong character
+		{"abc 123", false},     // space
+		{"abc123é", false},     // non-ASCII (2 bytes, so 8 total)
+		{"ab/c123", false},     // path separator
+		{"../etc/", false},     // traversal-shaped
+		{strings.Repeat("a", 1024), false},
+	}
+	for _, c := range cases {
+		if got := validKey(c.key); got != c.want {
+			t.Errorf("validKey(%q) = %v, want %v", c.key, got, c.want)
+		}
+	}
+}
+
+// A key that key-generator could never have issued must be answered with a
+// (briefly cacheable) 404 without touching L1, L2 or DynamoDB.
+func TestRedirectRejectsMalformedKeysWithoutLookups(t *testing.T) {
+	for _, key := range []string{"favicon.ico", "abc", "abc12345", "abc-123", strings.Repeat("a", 2000)} {
+		t.Run(key[:min(len(key), 20)], func(t *testing.T) {
+			f := &fakeGetter{out: &dynamodb.GetItemOutput{Item: item("abc1234", "https://example.com/")}}
+			l2 := newFakeL2()
+			h := &handler{
+				ddb: f, table: "test-table",
+				l1: newL1Cache(time.Minute, 10), l2: l2,
+				notFoundCacheControl: "public, max-age=30",
+			}
+
+			resp, err := h.Redirect(context.Background(), requestFor(key))
+			if err != nil {
+				t.Fatalf("Redirect() returned error: %v", err)
+			}
+			if resp.StatusCode != 404 {
+				t.Errorf("status = %d, want 404", resp.StatusCode)
+			}
+			if got := resp.Headers["Cache-Control"]; got != "public, max-age=30" {
+				t.Errorf("Cache-Control = %q, want the not-found value", got)
+			}
+			if f.calls != 0 {
+				t.Errorf("DynamoDB called %d times, want 0", f.calls)
+			}
+			if len(l2.getKeys) != 0 {
+				t.Errorf("L2 consulted %d times, want 0", len(l2.getKeys))
+			}
+		})
+	}
+}
+
+func TestRedirectOriginSecret(t *testing.T) {
+	const secret = "s3cr3t-value"
+	req := func(headerValue *string) events.APIGatewayV2HTTPRequest {
+		r := requestFor("abc1234")
+		if headerValue != nil {
+			r.Headers = map[string]string{originSecretHeader: *headerValue}
+		}
+		return r
+	}
+	str := func(s string) *string { return &s }
+
+	cases := []struct {
+		name       string
+		secret     string
+		request    events.APIGatewayV2HTTPRequest
+		wantStatus int
+		wantLookup bool
+	}{
+		{"check disabled, no header", "", req(nil), 302, true},
+		{"correct secret", secret, req(str(secret)), 302, true},
+		{"header missing", secret, req(nil), 403, false},
+		{"wrong secret", secret, req(str("nope")), 403, false},
+		{"empty header", secret, req(str("")), 403, false},
+		{"secret with a suffix", secret, req(str(secret + "x")), 403, false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := &fakeGetter{out: &dynamodb.GetItemOutput{Item: item("abc1234", "https://example.com/")}}
+			h := &handler{ddb: f, table: "test-table", originSecret: c.secret}
+
+			resp, err := h.Redirect(context.Background(), c.request)
+			if err != nil {
+				t.Fatalf("Redirect() returned error: %v", err)
+			}
+			if resp.StatusCode != c.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, c.wantStatus)
+			}
+			if got := f.calls > 0; got != c.wantLookup {
+				t.Errorf("DynamoDB looked up = %v, want %v", got, c.wantLookup)
+			}
+			if c.wantStatus == 403 && resp.Headers["Location"] != "" {
+				t.Errorf("a forbidden response leaked a Location header")
+			}
+		})
 	}
 }

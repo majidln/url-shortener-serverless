@@ -8,15 +8,28 @@ One load script, written in Step 1 and never changed. p50/p99 and cost recorded 
 
 Out of scope: EC2/containers, dev/prod environments, CI/CD pipeline.
 
+## Status
+
+| Step | What | Status | Tag | Cost at rest |
+|---|---|---|---|---|
+| 1 | Make it work | Done | `step-1-complete` | Free |
+| 2 | Custom domain over HTTPS | Done | `step-2-complete` | $0.50/month |
+| 3 | Observability and safe deploys | Done (all three proofs run) | not tagged | A few $/month |
+| 4 | Caching the redirect lookup | Done | `step-4-complete` | Cache stack bills hourly |
+| 5 | The edge | Fork decision still open | not tagged | WAF about $5/month |
+| 6 | Click analytics | Optional, not started | | |
+| 7 | Frontend | Optional, not started | | |
+
 ---
 
 ## 1. Prerequisites
 
-- [ ] AWS account, non-root IAM identity, budget alarm.
-- [ ] AWS CLI + **SAM CLI** installed (record the version).
-- [ ] **Go 1.21+** (for `log/slog`), and Docker for `sam local`.
-- [ ] **A domain with a Route 53 public hosted zone.** Step 2 can't start without one, and it's the only prerequisite that takes real-world time. A subdomain of a domain you already own is easiest. Avoid `.xyz`/`.top`/`.click`/`.link` — heavily used for phishing via shorteners, so short links on them get filtered and Step 2 looks broken.
-- [ ] A load-testing tool (`hey`, `k6`) and a script exercising create and redirect.
+- [ ] AWS account, non-root IAM identity, budget alarm. *(the budget alarm is not recorded anywhere in the repo, so left unchecked)*
+- [x] AWS CLI + **SAM CLI** installed. *(the version was never recorded)*
+- [x] **Go 1.21+** (for `log/slog`). The modules use Go 1.26.
+- [ ] Docker for `sam local`. *(not recorded)*
+- [x] **A domain with a Route 53 public hosted zone** (`link123.cfd`). Step 2 can't start without one, and it's the only prerequisite that takes real-world time. A subdomain of a domain you already own is easiest. Avoid `.xyz`/`.top`/`.click`/`.link` — heavily used for phishing via shorteners, so short links on them get filtered and Step 2 looks broken.
+- [x] A load-testing tool (`hey`) and a script exercising create and redirect (`scripts/loadtest.sh`).
 
 ---
 
@@ -51,7 +64,12 @@ Four constraints keep it reusable:
 ### Step 1 — Make it work
 Three Lambdas, HTTP API, DynamoDB table. See [STEP-1-GUIDE.md](docs/STEP-1-GUIDE.md).
 
-**Exit:** POST a URL, get a code; GET the code, get a redirect. Collision path forced and proven (shorten the key to 1–2 chars and hammer it). Generator's role has no DynamoDB permissions — check the role, not the code. Unit tests for `key-generator` pass with no AWS mocking; if mocking is needed, it isn't pure. Baseline recorded, cold and warm.
+**Exit:**
+- [x] POST a URL, get a code; GET the code, get a redirect.
+- [x] Collision path forced and proven. *(covered by `TestShortenRegeneratesOnCollision`; a live run with a 1–2 character key is not recorded in RESULTS.md)*
+- [x] Generator's role has no DynamoDB permissions — check the role, not the code. *(the function declares no `Policies` in `template.yaml`)*
+- [x] Unit tests for `key-generator` pass with no AWS mocking; if mocking is needed, it isn't pure.
+- [x] Baseline recorded, cold and warm ([RESULTS.md](RESULTS.md)).
 
 *Free. Leave it running.*
 
@@ -60,7 +78,11 @@ Three Lambdas, HTTP API, DynamoDB table. See [STEP-1-GUIDE.md](docs/STEP-1-GUIDE
 
 Hosted zone, ACM cert, API Gateway custom domain, alias record.
 
-**Exit:** `https://<domain>/<code>` redirects over HTTPS. Don't build for Step 5 — it moves this to CloudFront, and the rework is small.
+Don't build for Step 5 — it moves this to CloudFront, and the rework is small.
+
+**Exit:**
+- [x] `https://<domain>/<code>` redirects over HTTPS.
+- [x] A `step-2` row (redirect p50/p99 via the domain) in [RESULTS.md](RESULTS.md).
 
 *$0.50/month. Leave it running.*
 
@@ -73,14 +95,17 @@ Dashboard, alarms, SNS + email, structured logs, canary, and the auto-rollback f
 
 Traps: `TreatMissingData` (no traffic at 3am means no datapoints); rate not count, floored by a composite alarm so one bad request doesn't page; log retention defaults to never-expire.
 
-**Exit:** three proofs — force the alarm state and confirm the email arrives; break redirects for real and watch it fire and recover; then deploy a broken redirect Lambda and watch CodeDeploy roll it back while the alarm fires.
+**Exit:** three proofs.
+- [x] Force the alarm state and confirm the email arrives. *(effectively covered by the transitions in proof 2)*
+- [x] Break redirects for real and watch it fire and recover. *(canary alarm: 3m02s to fire, 3m26s to recover)*
+- [x] Deploy a broken redirect Lambda and watch CodeDeploy roll it back while the alarm fires. *(rolled back 3m44s after the traffic shift began; see RESULTS.md)*
 
 *A few $/month — first thing that bills at rest. Still fine to leave running.*
 
 ### Step 4 — Paying to run code that does a key lookup
 Every redirect invokes a function and crosses a region for an immutable value. (Not "cold starts dominate p99" — Go may not have that problem. Check the dashboard first.)
 
-In-memory LRU in the redirect Lambda, measured; then ElastiCache Redis on `cache.t4g.micro` (~$0.016/hr — priced hourly because this gets destroyed nightly), measured again.
+In-memory cache in the redirect Lambda, measured (it ended up a TTL map, not an LRU); then ElastiCache on `cache.t4g.micro` (Valkey, the Redis-compatible engine) (~$0.016/hr — priced hourly because this gets destroyed nightly), measured again.
 
 **The VPC is the real lesson.** ElastiCache is VPC-only, so the Lambda goes in a VPC and loses its internet route. The naive fix is a NAT Gateway at ~$32/month — the most expensive mistake available here. You don't need one: private subnets plus the **free DynamoDB gateway endpoint**. Zero NAT is the takeaway, and most tutorials get it wrong.
 
@@ -88,7 +113,10 @@ DAX rejected (VPC-bound, ~$30/month minimum, solves a microsecond problem). API 
 
 **Stack split:** VPC + ElastiCache go in a second stack, so the hourly-billed half can be deleted nightly without taking the alarms with it.
 
-**Exit:** hit rate and p99 recorded after each cache layer; no NAT Gateway in the account; cache stack deletes cleanly.
+**Exit:**
+- [x] Hit rate and p99 recorded after each cache layer.
+- [x] No NAT Gateway in the account (`aws ec2 describe-nat-gateways` returned empty).
+- [x] Cache stack deletes cleanly, and redirects keep working without it.
 
 *Stops being free at rest. Delete the cache stack before closing the laptop.*
 
@@ -105,7 +133,12 @@ CloudFront in front, deliberate `Cache-Control`, negative caching, WAF.
 
 **The fork to resolve in writing:** VPC+Redis and "no Lambda on the hot path at all" are incompatible — a VPC-attached Lambda can't collapse into an API Gateway → DynamoDB direct integration. Pick one, say why, keep the loser documented.
 
-**Exit:** share of requests never reaching the origin; Redis hit rate before and after; a takedown demonstrated end to end; the fork resolved.
+**Exit:**
+- [x] Share of requests never reaching the origin (86–88% at the edge).
+- [x] Cache hit rate before and after (the tier mix changed from 66/26/8 to 12/40/48 at the origin).
+- [x] A takedown demonstrated end to end (about 6 seconds when invalidated in the right order).
+- [ ] The fork resolved in writing. *(the Step 5 guide §8 decision is still pending)*
+- [x] The raw `execute-api` URL guarded. *(`X-Origin-Verify` header check, rolled out in two deploys and verified live: `403` without the secret)*
 
 *WAF is the biggest recurring cost (~$5/month). Destroy after each session.*
 
@@ -132,19 +165,20 @@ Deploy → verify the exit criteria by hand → record numbers in [RESULTS.md](R
 | Stack | Rule |
 |---|---|
 | Main application | Leave running |
-| Cache (VPC + ElastiCache), Step 4 | **`sam delete` before ending the session** |
+| Cache (ElastiCache), Step 4 | **`make cache-down` before ending the session** |
 | WAF, Step 5 | Delete if idle |
 
 A failed deploy is not a no-op — rollback can itself fail and strand a stack in `UPDATE_ROLLBACK_FAILED`. And log groups Lambda creates implicitly can outlive their stack, retaining logs forever; declare them with retention in Step 3.
 
 ---
 
-## 5. Still open
+## 5. Open questions, and what was decided
 
-| Question | Recommendation |
-|---|---|
-| Synthetic canary (Step 3) | Yes, 5-minute interval (~$1/month). No traffic at 3am means the alarm has nothing to evaluate, and the auto-rollback depends on it |
-| `max-age` (Step 5) | 300s, revisited against takedown speed |
-| Valkey vs Redis OSS (Step 4) | Valkey — API-compatible, cheaper |
+| Question | Recommendation | Decision |
+|---|---|---|
+| Synthetic canary (Step 3) | Yes, 5-minute interval (~$1/month). No traffic at 3am means the alarm has nothing to evaluate, and the auto-rollback depends on it | Yes, but every **1 minute** (`rate(1 minute)` in `template.yaml`), so the alarm fires in about 3 minutes |
+| `max-age` (Step 5) | 300s, revisited against takedown speed | Split: **`max-age=60`** for browsers (cannot be purged) and **`s-maxage=300`** for CloudFront (can be) |
+| Valkey vs Redis OSS (Step 4) | Valkey — API-compatible, cheaper | Valkey |
+| Fork: VPC + cache vs no Lambda on the hot path (Step 5) | Pick one, say why | **Still open** |
 
 *Costs are approximate `us-east-1` list prices. Confirm before relying on them.*

@@ -6,6 +6,32 @@ arm64, DynamoDB on-demand, HTTP API.
 The warm section of `loadtest.sh` (seed + create burst + redirect burst) is the
 frozen baseline — later steps re-run it unchanged and add a row here.
 
+`§N` references below point to sections of the matching step guide in `docs/`.
+
+## Summary
+
+The frozen warm run, one row per step (single hot key, p50 / p99).
+
+| Step | What changed | `POST /shorten` | `GET /{code}` |
+|---|---|---|---|
+| 1 | Baseline | 149 ms / 2258 ms | 125 ms / 158 ms |
+| 2 | Custom domain | 154 ms / 1887 ms | 129 ms / 179 ms |
+| 3 | Alarms, canary, safe deploys | 144 ms / 1957 ms | 132 ms / 171 ms |
+| 4 | L1 + L2 cache | 142 ms / 1828 ms | 124 ms / 158 ms |
+| 5 | CloudFront edge | 151 ms / 1988 ms | **6.9 ms** / 10.9 ms |
+
+- Steps 2 to 4 are all noise around the same API Gateway, TLS and network floor. Only the edge moves the redirect number.
+- The create `p99` is a handful of cold containers in the opening requests, in every run.
+- At the edge, 86 to 88% of requests never reach the origin.
+
+## Contents
+
+- [Step 1 — baseline](#step-1--baseline)
+- [Step 2 — custom domain over HTTPS](#step-2--custom-domain-over-https)
+- [Step 3 — observability & safe deploys](#step-3--observability--safe-deploys)
+- [Step 4 — caching the redirect lookup](#step-4--caching-the-redirect-lookup)
+- [Step 5 — the edge (CloudFront + Cache-Control)](#step-5--the-edge-cloudfront--cache-control)
+
 ---
 
 ## Step 1 — baseline
@@ -59,11 +85,9 @@ warm-only window puts it closer to ~15 ms). Either way it is a small slice of th
 149 ms end-to-end create p50, which is dominated by API Gateway + TLS + network.
 This is the number the "separate Lambda for the key" decision trades against.
 
----
+### Step 1 findings
 
-## Findings
-
-### 1. Redirect path throttles above 10 concurrent
+#### 1. Redirect path throttles above 10 concurrent
 
 `GET /{code}` at `-c 50`:
 
@@ -75,7 +99,7 @@ Cause: the account's Lambda concurrency limit of 10. API Gateway turns a Lambda
 Quotas increase ("Concurrent executions" → 1000). The `-c 10` numbers above are
 the clean, like-for-like series to carry forward.
 
-### 2. Create path saturates the ceiling at low concurrency
+#### 2. Create path saturates the ceiling at low concurrency
 
 Each `POST /shorten` occupies **two** concurrency slots for the duration of the
 synchronous key-generator invoke, so `-c 10` alone would saturate a limit-10
@@ -84,7 +108,7 @@ account. The frozen baseline runs create at `-c 5`, where it is clean:
 `Invoke` (for `TooManyRequestsException`) would make the create path resilient to
 transient throttles regardless of the account limit — noted, not done at Step 1.
 
-### 3. Collision handling adds no measurable latency
+#### 3. Collision handling adds no measurable latency
 
 Warm p50 with the conditional write + retry in place (create 149 ms, redirect
 125 ms) is within noise of the earlier plain-`PutItem` run (143 ms / 127 ms).
@@ -195,12 +219,37 @@ Lesson: CLI test levers (`put-function-concurrency`, env-var overrides on
 deployed service now that `AutoPublishAlias` pins traffic to a published
 version.
 
-### Not yet run
+### Proof 3 — broken deploy, rolled back automatically
 
-Proof 1 (force alarm state) is trivial and effectively covered by the transitions
-above. Proof 3 (ship a deliberately broken redirect, watch CodeDeploy roll it
-back inside the 5-minute bake) still pending — needs a redirect code change plus
-load during the bake.
+Proof 1 (force alarm state) is covered by the transitions above. Proof 3 was run
+on 2026-10-21 against a fresh stack.
+
+The redirect handler was changed to return `500` for every request, built and
+deployed with the normal `sam deploy`. About 10 requests/s of **random,
+never-seen keys** went through `link123.cfd` for the whole window, so every
+request missed CloudFront and reached the origin (a repeat of one key would have
+been served by the edge and never reached either version).
+
+| Event | Time (CEST) | Since the traffic shift began |
+|---|---|---|
+| CodeDeploy starts shifting 10% to the broken version | 15:25:08 | 0 |
+| `http-5xx-rate` goes `OK` → `ALARM` | 15:28:31 | 3m23s |
+| Deployment stopped (`ALARM_ACTIVE`), automatic rollback triggered | 15:28:49 | 3m41s |
+| Rollback deployment `Succeeded`, alias back on the good version | 15:28:52 | 3m44s |
+| `http-5xx-rate` back to `OK` | 15:32:31 | 7m23s |
+
+- The load generator sent 4,330 requests: 4,156 `404` (the good version) and 174 `500`
+  (the broken one), 4.0% overall because the broken version was live for only about
+  3.5 of the 9 minutes.
+- The alarm that tripped was `http-5xx-rate`, as designed (it fires after 3 bad
+  minutes, inside the 5-minute bake). `canary-redirect` stayed `OK`: with 10% of
+  traffic on the bad version and one probe a minute, most probes landed on the
+  good version or on the edge.
+- CloudFormation ended in `UPDATE_ROLLBACK_COMPLETE`, so `sam deploy` exited with
+  an error even though the service was back on the previous version within seconds.
+  Expect that: a rolled-back deploy looks like a failed deploy.
+- After the rollback the alias pointed at the previous version with no weighted
+  routing left, and shorten and redirect worked normally.
 
 ---
 
@@ -297,7 +346,7 @@ s-maxage=300`; 404s get `public, max-age=30`) instead of `no-store`. CloudFront
 sits in front with its own cache policy (path-only key, `0/0/3600` TTL) and
 `AllViewerExceptHostHeader`; `/shorten` stays `CachingDisabled`. Domain moved
 from the API Gateway custom domain to CloudFront in two sequential deploys
-(§4), with a real, brief `link123.cfd` outage in between. Paging alarm moved
+(Step 5 guide §4), with a real, brief `link123.cfd` outage in between. Paging alarm moved
 to `AWS/CloudFront` `5xxErrorRate`; the old HTTP API alarm stays as an
 origin-level signal.
 
@@ -316,7 +365,9 @@ there's no backend round trip left to pay for. This is the result the guide
 was building toward: cache the 302 *deliberately* and the latency win finally
 shows up.
 
-### Origin share — same load, measured via CloudWatch (5-min buckets, matching CloudFront's free-tier granularity)
+### Origin share
+
+Same load as above, measured via CloudWatch in 5-minute buckets, which matches CloudFront's free-tier granularity.
 
 | Workload | CloudFront `Requests` | API GW `Count` | origin share | edge share |
 |---|---|---|---|---|
@@ -362,7 +413,7 @@ burst ran 8-way parallel across codes with `-c 3` each, so a handful of
 concurrent requests for the same key could race past the edge cache before
 the first response populated it.
 
-### WAF (§6)
+### WAF
 
 `AWSManagedRulesAmazonIpReputationList` + `AWSManagedRulesKnownBadInputsRuleSet`,
 plus a custom rate-based rule: `POST /shorten`, 100 req/5min/IP (WAFv2's
@@ -394,13 +445,13 @@ the decoy IP from the block-demo step), not your intended one. Worth checking
 what's actually deployed after any rollback, not just what SSM says — they
 can disagree.
 
-**Not yet done:** the execute-api gap from §6 ("WAF only guards traffic
+**Not yet done:** the execute-api gap from the WAF design ("WAF only guards traffic
 through CloudFront; the raw execute-api origin is still public and
 unguarded") — no secret-header check added yet. Decided to leave as a known,
 written gap rather than build it now; revisit if this ever handles real
 traffic.
 
-### Takedown, end to end (§9)
+### Takedown, end to end
 
 Three links, three runs, to separate the real signal from timing accidents.
 
@@ -449,6 +500,33 @@ its own window closed. If the browser-persistence behavior needs to be
 demonstrable *and* safe to invalidate immediately after, the origin TTL and
 the browser `max-age` need to be pulled apart, not left at the same value.
 
-### Not yet run
+### Origin secret — the `execute-api` gap, closed
 
-The §8 fork decision is still pending.
+CloudFront adds `X-Origin-Verify` (from `/url-shortener/origin-secret`) and both
+functions answer `403` without it. Rolled out in two deploys on 2026-10-21.
+Verified on the live stack with the flag on:
+
+| Request | Result |
+|---|---|
+| `GET` raw `execute-api` URL, no header (10 times) | `403` × 10 |
+| `GET` raw URL, wrong secret | `403` |
+| `GET` raw URL, right secret | `302` (the check is a header comparison, not a blanket block) |
+| `POST /shorten` on the raw URL, no header | `403` |
+| `GET` and `POST` through `link123.cfd` | `302` and `200` |
+
+Also verified live: `POST /shorten` with `javascript:alert(1)`, `https://trusted.com@evil.com/`
+and `example.com` returns `400`, and `GET /favicon.ico` returns a `404` with
+`Cache-Control: public, max-age=30`.
+
+**Finding: a config-only change never reached the redirect alias.** The first
+"enforce" deploy changed only an environment variable. The shortener picked it up
+(`403` on the raw URL) but the redirect did not, because `AutoPublishAlias` by default
+publishes a new version only when the code changes. The change landed on `$LATEST`,
+the `live` alias stayed on version 1, and no CodeDeploy deployment ran. The same
+gap meant any config change to the redirect function bypassed the canary gate.
+Fixed with `AutoPublishAliasAllProperties: true`; the next deploy published
+version 2 and shifted traffic through the normal 10% canary.
+
+### Open
+
+- The fork decision (VPC + cache vs no Lambda on the hot path, Step 5 guide §8) is still pending.
